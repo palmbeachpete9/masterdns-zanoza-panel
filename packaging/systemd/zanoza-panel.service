@@ -1,0 +1,22 @@
+[Unit]
+Description=Zanoza Panel (MasterDnsVPN manager)
+Documentation=https://github.com/palmbeachpete9/masterdns-zanoza-panel
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=MASTERDNS_BIN=/usr/local/bin/masterdns-server
+ExecStart=/usr/local/bin/zanoza-panel -config /etc/zanoza-panel/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+
+# The panel supervises the MasterDnsVPN server which binds UDP :53,
+# so it needs the privilege to bind low ports (run as root, or grant
+# CAP_NET_BIND_SERVICE to the masterdns-server binary).
+
+[Install]
+WantedBy=multi-user.target
