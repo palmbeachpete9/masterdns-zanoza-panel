@@ -111,8 +111,9 @@ func main() {
 	// zanoza-panel fork: when KEYRING_FILE is set, the server serves many
 	// domains with per-domain keys and skips the single-key setup entirely.
 	var keyResolver *keyring.Resolver
+	var keyringPath string
 	if cfg.KeyringFile != "" {
-		keyringPath := cfg.KeyringFile
+		keyringPath = cfg.KeyringFile
 		if !filepath.IsAbs(keyringPath) {
 			keyringPath = filepath.Join(cfg.ConfigDir, keyringPath)
 		}
@@ -171,6 +172,23 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// zanoza-panel fork: reload the keyring on SIGHUP so the panel can add or
+	// remove domains+keys live. Without this handler SIGHUP would terminate
+	// the process (Go's default action), killing the server on every change.
+	if keyringPath != "" {
+		hup := make(chan os.Signal, 1)
+		signal.Notify(hup, syscall.SIGHUP)
+		go func() {
+			for range hup {
+				if err := srv.ReloadKeyring(keyringPath); err != nil {
+					log.Errorf("❌ <red>Keyring Reload Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
+				} else {
+					log.Infof("\U0001F501 <green>Keyring reloaded from <cyan>%s</cyan></green>", keyringPath)
+				}
+			}
+		}()
+	}
 
 	log.Infof("\U0001F680 <green>Server Configuration Loaded</green>")
 	if len(cfg.Domain) > 0 {

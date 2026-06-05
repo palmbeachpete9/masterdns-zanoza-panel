@@ -43,8 +43,10 @@ type Server struct {
 	cfg                      config.ServerConfig
 	log                      *logger.Logger
 	codec                    *security.Codec
-	keyResolver              *keyring.Resolver // zanoza-panel fork: per-domain keys
-	domainMatcher            *domainMatcher.Matcher
+	// zanoza-panel fork: keyResolver and matcher are swapped atomically on
+	// SIGHUP so the panel can add/remove domains+keys without restarting.
+	keyResolver              atomic.Pointer[keyring.Resolver]
+	matcher                  atomic.Pointer[domainMatcher.Matcher]
 	sessions                 *sessionStore
 	deferredDNSSession       *deferredSessionProcessor
 	deferredConnectSession   *deferredSessionProcessor
@@ -121,11 +123,10 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 	sessions := newSessionStore(cfg.EffectiveSessionOrphanQueueInitialCap(), cfg.EffectiveStreamQueueInitialCapacity(), cfg.SessionInitReuseTTL(), cfg.RecentlyClosedStreamTTL(), cfg.RecentlyClosedStreamCap)
 	sessions.maxActiveSessions = cfg.MaxAllowedClientActiveSessions
 	sessions.maxActiveStreams = cfg.MaxAllowedClientActiveStreams
-	return &Server{
+	srv := &Server{
 		cfg:                    cfg,
 		log:                    log,
 		codec:                  codec,
-		domainMatcher:          domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
 		sessions:               sessions,
 		deferredDNSSession:     newDeferredSessionProcessor(dnsDeferredWorkers, dnsDeferredQueue, log),
 		deferredConnectSession: newDeferredSessionProcessor(connectDeferredWorkers, connectDeferredQueue, log),
@@ -173,6 +174,8 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 	}
+	srv.matcher.Store(domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength))
+	return srv
 }
 
 type throttledLogState struct {

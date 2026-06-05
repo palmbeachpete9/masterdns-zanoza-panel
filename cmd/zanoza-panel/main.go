@@ -261,6 +261,10 @@ func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
 	s.mu.Lock()
 	path := s.cfg.PanelPath
 	s.mu.Unlock()
+	maxAge := 12 * 3600
+	if token == "" {
+		maxAge = -1 // expire immediately on logout
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    token,
@@ -268,7 +272,7 @@ func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
 		HttpOnly: true,
 		Secure:   s.useTLS,
 		SameSite: http.SameSiteLaxMode,
-		MaxAge:   12 * 3600,
+		MaxAge:   maxAge,
 	})
 }
 

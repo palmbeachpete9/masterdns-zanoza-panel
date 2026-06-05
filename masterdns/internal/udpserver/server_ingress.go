@@ -33,7 +33,7 @@ func (s *Server) handlePacket(packet []byte) []byte {
 		return s.buildNoDataResponseLogged(packet, "request-has-no-question")
 	}
 
-	decision := s.domainMatcher.Match(parsed)
+	decision := s.matcher.Load().Match(parsed)
 	if decision.Action == domainMatcher.ActionProcess {
 		response := s.handleTunnelCandidate(packet, parsed, decision)
 		if response != nil {
@@ -54,14 +54,27 @@ func (s *Server) handlePacket(packet []byte) []byte {
 // set, inbound tunnel labels are decrypted with the key(s) bound to the
 // queried domain instead of the single global codec.
 func (s *Server) SetKeyResolver(resolver *keyring.Resolver) {
-	s.keyResolver = resolver
+	s.keyResolver.Store(resolver)
+}
+
+// ReloadKeyring atomically swaps the per-domain keyring and the domain
+// matcher from keyring.json. Called on SIGHUP so the panel can add/remove
+// domains+keys without restarting the server (no dropped sessions).
+func (s *Server) ReloadKeyring(path string) error {
+	resolver, err := keyring.Load(path)
+	if err != nil {
+		return err
+	}
+	s.matcher.Store(domainMatcher.New(resolver.Domains(), s.cfg.MinVPNLabelLength))
+	s.keyResolver.Store(resolver)
+	return nil
 }
 
 // parseInboundLabels decrypts+parses tunnel labels using the per-domain
 // keyring when configured, falling back to the legacy single codec.
 func (s *Server) parseInboundLabels(baseDomain, labels string) (VpnProto.Packet, error) {
-	if s.keyResolver != nil && !s.keyResolver.Empty() {
-		return s.keyResolver.Parse(baseDomain, labels)
+	if r := s.keyResolver.Load(); r != nil && !r.Empty() {
+		return r.Parse(baseDomain, labels)
 	}
 	return VpnProto.ParseInflatedFromLabels(labels, s.codec)
 }

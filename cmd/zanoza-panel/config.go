@@ -86,19 +86,25 @@ func (c *Config) normalize() {
 }
 
 func (c *Config) save() error {
+	// Serialize normalize()+marshal against concurrent instance mutations so
+	// json.Marshal never reads the slice while another request is writing it.
+	// Callers never hold c.mu when calling save(), so this cannot deadlock.
+	c.mu.Lock()
 	c.normalize()
-	if err := os.MkdirAll(filepath.Dir(c.path), 0o755); err != nil {
-		return err
-	}
 	raw, err := json.MarshalIndent(c, "", "  ")
+	path := c.path
+	c.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	tmp := c.path + ".tmp"
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, c.path)
+	return os.Rename(tmp, path)
 }
 
 // snapshot returns a copy of the instance list under lock.
