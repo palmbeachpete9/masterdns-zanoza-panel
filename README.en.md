@@ -10,6 +10,14 @@ Web panel and process manager for [MasterDnsVPN](https://github.com/masterking32
 
 The admin creates "instances" (a **domain + encryption key** pair) and hands them to users: each instance shows as `domain + key` and can be copied as a `zanoza://` link for one-tap import into the Zanoza app.
 
+## Screenshots
+
+![Panel — instances list](docs/dashboard.png)
+
+![Create instance](docs/create-instance.png)
+
+![Login](docs/login.png)
+
 ## Install
 
 Ubuntu / Debian VPS, as root:
