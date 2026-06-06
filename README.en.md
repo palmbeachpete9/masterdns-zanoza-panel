@@ -83,14 +83,19 @@ masterdns-zanoza-panel/
 ## Build from source
 
 ```sh
-# frontend -> cmd/zanoza-panel/web/dist (needs node)
+# tools (once)
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+go install mvdan.cc/gofumpt@latest
+
+# frontend (needs node)
 npm install && npm run build
 
-# panel (embeds web/dist)
-go build -o zanoza-panel ./cmd/zanoza-panel
-
-# forked MasterDnsVPN server
-cd masterdns && go build -o masterdns-server ./cmd/server
+# everything via Makefile
+make fmt      # format with gofumpt
+make lint     # golangci-lint
+make test     # tests with -race
+make build    # compile binaries
+make check    # all at once (CI)
 ```
 
 ## Credits

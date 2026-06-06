@@ -84,14 +84,19 @@ masterdns-zanoza-panel/
 ## Сборка из исходников
 
 ```sh
-# фронтенд -> cmd/zanoza-panel/web/dist (нужен node)
+# инструменты (один раз)
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+go install mvdan.cc/gofumpt@latest
+
+# фронтенд (нужен node)
 npm install && npm run build
 
-# панель (встраивает web/dist)
-go build -o zanoza-panel ./cmd/zanoza-panel
-
-# форк сервера MasterDnsVPN
-cd masterdns && go build -o masterdns-server ./cmd/server
+# всё через Makefile
+make fmt      # форматирование gofumpt
+make lint     # golangci-lint
+make test     # тесты с -race
+make build    # собрать бинарники
+make check    # всё сразу (CI)
 ```
 
 ## Благодарности
