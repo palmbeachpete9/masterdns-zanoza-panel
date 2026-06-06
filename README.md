@@ -12,7 +12,7 @@
 
 ## Установка
 
-Debian/Ubuntu VPS, от root:
+Ubuntu / Debian VPS, от root:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
