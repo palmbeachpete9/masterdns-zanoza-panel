@@ -19,24 +19,24 @@ func envDefault(key, fallback string) string {
 // already-loaded config.  Env vars take precedence over config file values.
 // Call after loadConfig and before useTLS / panel-addr decisions.
 func applyEnvOverrides(cfg *Config) {
-	if v := os.Getenv("ZANOZA_PANEL_ADDR"); v != "" {
+	if v := os.Getenv(EnvPanelAddr); v != "" {
 		cfg.PanelAddr = v
 	}
-	if v := os.Getenv("ZANOZA_PANEL_PORT"); v != "" {
+	if v := os.Getenv(EnvPanelPort); v != "" {
 		if port, err := strconv.Atoi(v); err == nil && port > 0 && port <= 65535 {
 			cfg.PanelPort = port
 		}
 	}
-	if v := os.Getenv("ZANOZA_PANEL_PATH"); v != "" {
+	if v := os.Getenv(EnvPanelPath); v != "" {
 		cfg.PanelPath = v
 	}
-	if v := os.Getenv("ZANOZA_TLS_CERT"); v != "" {
+	if v := os.Getenv(EnvTLSCert); v != "" {
 		cfg.TLSCert = v
 	}
-	if v := os.Getenv("ZANOZA_TLS_KEY"); v != "" {
+	if v := os.Getenv(EnvTLSKey); v != "" {
 		cfg.TLSKey = v
 	}
-	if v := os.Getenv("ZANOZA_NAME"); v != "" {
+	if v := os.Getenv(EnvName); v != "" {
 		cfg.Name = v
 	}
 	cfg.normalize()
@@ -48,8 +48,8 @@ func maybeAutoSetup(creds *credentials) {
 	if !creds.setupRequired() {
 		return
 	}
-	user := os.Getenv("ZANOZA_USER")
-	pass := os.Getenv("ZANOZA_PASSWORD")
+	user := os.Getenv(EnvUser)
+	pass := os.Getenv(EnvPassword)
 	if user == "" || pass == "" {
 		return
 	}

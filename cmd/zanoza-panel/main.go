@@ -36,7 +36,7 @@ type server struct {
 }
 
 func main() {
-	configPath := flag.String("config", envDefault("ZANOZA_CONFIG", "/etc/zanoza-panel/config.json"), "path to panel config JSON")
+	configPath := flag.String("config", envDefault(EnvConfig, "/etc/zanoza-panel/config.json"), "path to panel config JSON")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
@@ -48,7 +48,7 @@ func main() {
 	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
 	maybeAutoSetup(creds)
-	manager := newServerManager(envDefault("ZANOZA_RUNTIME_DIR", filepath.Join(configDir, "masterdns")))
+	manager := newServerManager(envDefault(EnvRuntimeDir, filepath.Join(configDir, "masterdns")))
 
 	webRoot, err := fs.Sub(embeddedWeb, "web/dist")
 	if err != nil {
