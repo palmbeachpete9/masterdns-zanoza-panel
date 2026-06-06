@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"strconv"
 )
@@ -52,5 +53,7 @@ func maybeAutoSetup(creds *credentials) {
 	if user == "" || pass == "" {
 		return
 	}
-	_ = creds.set(user, pass)
+	if err := creds.set(user, pass); err != nil {
+		log.Printf("auto-setup credentials failed: %v", err)
+	}
 }
