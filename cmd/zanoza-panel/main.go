@@ -36,17 +36,21 @@ type server struct {
 }
 
 func main() {
-	configPath := flag.String("config", "/etc/zanoza-panel/config.json", "path to panel config JSON")
+	configPath := flag.String("config", envDefault(EnvConfig, "/etc/zanoza-panel/config.json"), "path to panel config JSON")
 	flag.Parse()
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
+	// ZANOZA_* env vars win over saved config.json (runtime-only, not persisted).
+	applyEnvOverrides(cfg)
 
 	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
-	manager := newServerManager(filepath.Join(configDir, "masterdns"))
+	// First-run only: bootstrap admin from ZANOZA_USER / ZANOZA_PASSWORD.
+	maybeAutoSetup(creds)
+	manager := newServerManager(envDefault(EnvRuntimeDir, filepath.Join(configDir, "masterdns")))
 
 	webRoot, err := fs.Sub(embeddedWeb, "web/dist")
 	if err != nil {
