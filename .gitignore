@@ -13,3 +13,7 @@ package-lock.json
 
 # Vendored masterdns build artefacts
 masterdns/bin/
+
+# Go tooling cache
+.golangci-lint-cache/
+.mk/
