@@ -6,8 +6,6 @@ import (
 	"strconv"
 )
 
-// envDefault returns the value of key from the environment, or fallback if
-// the key is unset or empty.
 func envDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -15,9 +13,7 @@ func envDefault(key, fallback string) string {
 	return fallback
 }
 
-// applyEnvOverrides applies ZANOZA_* environment variables on top of an
-// already-loaded config.  Env vars take precedence over config file values.
-// Call after loadConfig and before useTLS / panel-addr decisions.
+// applyEnvOverrides overrides cfg fields from ZANOZA_* env vars.
 func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv(EnvPanelAddr); v != "" {
 		cfg.PanelAddr = v
@@ -42,8 +38,7 @@ func applyEnvOverrides(cfg *Config) {
 	cfg.normalize()
 }
 
-// maybeAutoSetup seeds initial admin credentials from ZANOZA_USER and
-// ZANOZA_PASSWORD env vars when the credentials file is empty (first run).
+// maybeAutoSetup creates admin from ZANOZA_USER/ZANOZA_PASSWORD on first run.
 func maybeAutoSetup(creds *credentials) {
 	if !creds.setupRequired() {
 		return

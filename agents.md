@@ -19,6 +19,10 @@
 ## Structure
 - `cmd/name/main.go` for each binary. `internal/` for private packages
 
+## Comments
+- Short doc comment on exported funcs only when the signature isn't enough.
+- No inline comments mid-code.
+
 ## Commits
 - **English only.** Conventional: `type: description` (`feat`, `fix`, `chore`, ...)
 
