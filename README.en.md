@@ -10,11 +10,9 @@ Web panel and process manager for [MasterDnsVPN](https://github.com/masterking32
 
 The admin creates "instances" (a **domain + encryption key** pair) and hands them to users: each instance shows as `domain + key` and can be copied as a `zanoza://` link for one-tap import into the Zanoza app.
 
-The UI is based on [olcrtc-manager-panel](https://github.com/BigDaddy3334/olcrtc-manager-panel); the backend is a fork of the MasterDnsVPN server with **per-domain keyring selection** (see below).
-
 ## Install
 
-Debian/Ubuntu VPS, as root:
+Ubuntu / Debian VPS, as root:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
