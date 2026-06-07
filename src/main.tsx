@@ -525,14 +525,14 @@ function App() {
       }
       setShowCreate(false);
       await loadState();
-    }, editing ? "Инстанс сохранён" : "Инстанс создан");
+    }, editing ? "Хост сохранён" : "Хост создан");
 
   const deleteInstance = (instance: Instance) =>
     runAction(async () => {
       if (!window.confirm(`Удалить ключ «${instance.label || instance.id}» на домене ${instance.domain}?`)) return;
       await request(`api/instances/${encodeURIComponent(instance.id)}`, { method: "DELETE" });
       await loadState();
-    }, "Инстанс удалён");
+    }, "Хост удалён");
 
   const restartServer = () =>
     runAction(async () => {
@@ -587,7 +587,7 @@ function App() {
           <h1 className="text-2xl font-semibold tracking-normal">Zanoza Panel</h1>
           <div className="flex flex-wrap items-center gap-2">
             <HeaderMetric label="Panel mem" value={formatBytes(metrics?.memory.heap_alloc_bytes)} />
-            <HeaderMetric label="Server" value={metrics?.server.running ? "running" : "stopped"} />
+            <HeaderMetric label="Server" value={metrics?.server.running ? "Running" : "Stopped"} />
             <HeaderMetric label="Server PID" value={metrics?.server.pid ?? "..."} />
             <button
               className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80"
@@ -625,7 +625,7 @@ function App() {
             label="Сервер"
             value={
               <span className={state?.server.running ? "text-primary" : "text-destructive"}>
-                {state?.server.running ? "running" : "stopped"}
+                {state?.server.running ? "Running" : "Stopped"}
               </span>
             }
           />
@@ -633,7 +633,7 @@ function App() {
 
         <section className="mt-4 rounded-lg border border-border bg-card p-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-lg font-semibold tracking-normal">Инстансы</h2>
+            <h2 className="text-lg font-semibold tracking-normal">Хосты</h2>
             <div className="flex flex-wrap gap-2">
               <button
                 className="inline-flex h-9 items-center gap-2 rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80 disabled:opacity-60"
@@ -648,7 +648,7 @@ function App() {
                 onClick={() => openCreate()}
               >
                 <Plus className="h-4 w-4" />
-                Создать инстанс
+                Создать хост
               </button>
             </div>
           </div>
@@ -659,7 +659,7 @@ function App() {
             <div className="mt-6 grid place-items-center gap-2 rounded-md border border-dashed border-border py-12 text-center">
               <Globe className="h-8 w-8 text-muted-foreground" />
               <div className="text-sm text-muted-foreground">
-                Инстансов пока нет. Создайте первый — домен + ключ.
+                Хостов пока нет. Создайте первый — домен + ключ.
               </div>
             </div>
           ) : (
@@ -778,7 +778,7 @@ function App() {
       </main>
 
       {showCreate && (
-        <Modal title={editing ? "Изменить инстанс" : "Создать инстанс"} onClose={() => setShowCreate(false)}>
+        <Modal title={editing ? "Изменить хост" : "Создать хост"} onClose={() => setShowCreate(false)}>
           <div className="grid gap-4 p-5">
             <InstanceFormFields
               form={form}
