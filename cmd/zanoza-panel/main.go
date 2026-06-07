@@ -43,12 +43,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	// ZANOZA_* env vars win over saved config.json (runtime-only, not persisted).
 	applyEnvOverrides(cfg)
 
 	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
-	// First-run only: bootstrap admin from ZANOZA_USER / ZANOZA_PASSWORD.
 	maybeAutoSetup(creds)
 	manager := newServerManager(envDefault(EnvRuntimeDir, filepath.Join(configDir, "masterdns")))
 
@@ -81,6 +79,7 @@ func main() {
 		signal.Notify(ch, syscall.SIGHUP)
 		for range ch {
 			if reloaded, err := loadConfig(*configPath); err == nil {
+				applyEnvOverrides(reloaded)
 				srv.mu.Lock()
 				srv.cfg = reloaded
 				srv.mu.Unlock()
@@ -220,9 +219,9 @@ func (s *server) api(w http.ResponseWriter, r *http.Request, rest string) {
 	}
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	w.WriteHeader(status)
+	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(v)
 }
 
@@ -233,7 +232,7 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 }
 
 func decodeJSON(r *http.Request, v any) error {
-	defer r.Body.Close()
+	defer func() { _ = r.Body.Close() }()
 	return json.NewDecoder(r.Body).Decode(v)
 }
 
@@ -281,7 +280,7 @@ func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
 }
 
 func (s *server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, map[string]any{
 		"authenticated":  s.authenticated(r),
 		"setup_required": s.creds.setupRequired(),
 	})
@@ -302,7 +301,7 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, s.sessions.create())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -316,7 +315,7 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setSessionCookie(w, s.sessions.create())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -324,7 +323,7 @@ func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		s.sessions.revoke(c.Value)
 	}
 	s.setSessionCookie(w, "")
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
@@ -344,7 +343,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		s.sessions.revoke(c.Value)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +368,7 @@ func (s *server) handleState(w http.ResponseWriter, _ *http.Request) {
 		views = append(views, instanceView{Instance: ins, ZanozaLink: zanozaLink(ins)})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, map[string]any{
 		"name":           cfg.Name,
 		"panel_path":     cfg.PanelPath,
 		"domain_count":   len(domains),
@@ -382,7 +381,7 @@ func (s *server) handleState(w http.ResponseWriter, _ *http.Request) {
 func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	var mem runtime.MemStats
 	runtime.ReadMemStats(&mem)
-	writeJSON(w, http.StatusOK, map[string]any{
+	writeJSON(w, map[string]any{
 		"go":     map[string]any{"version": runtime.Version(), "goroutines": runtime.NumGoroutine()},
 		"memory": map[string]any{"heap_alloc_bytes": mem.HeapAlloc},
 		"panel":  map[string]any{"pid": os.Getpid()},
@@ -397,7 +396,7 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 
 	switch r.Method {
 	case http.MethodGet:
-		writeJSON(w, http.StatusOK, map[string]any{
+		writeJSON(w, map[string]any{
 			"name":       cfg.Name,
 			"panel_path": cfg.PanelPath,
 			"admin_user": s.creds.username(),
@@ -417,7 +416,7 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true})
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -450,7 +449,7 @@ func (s *server) handleInstancesCollection(w http.ResponseWriter, r *http.Reques
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, instanceView{Instance: in, ZanozaLink: zanozaLink(in)})
+	writeJSON(w, instanceView{Instance: in, ZanozaLink: zanozaLink(in)})
 }
 
 func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id string) {
@@ -480,7 +479,7 @@ func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id s
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true})
 	case http.MethodDelete:
 		if err := s.mutateInstances(func(list []Instance) ([]Instance, error) {
 			idx := indexOfInstance(list, id)
@@ -492,7 +491,7 @@ func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id s
 			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		writeJSON(w, map[string]any{"ok": true})
 	default:
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -507,7 +506,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
@@ -515,7 +514,7 @@ func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true})
 }
 
 // mutateInstances applies fn to a copy of the instance list, persists, and

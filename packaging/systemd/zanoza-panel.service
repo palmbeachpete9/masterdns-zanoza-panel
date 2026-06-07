@@ -6,7 +6,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-Environment=MASTERDNS_BIN=/usr/local/bin/masterdns-server
+Environment=ZANOZA_MASTERDNS_BIN=/usr/local/bin/masterdns-server
 ExecStart=/usr/local/bin/zanoza-panel -config /etc/zanoza-panel/config.json
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
