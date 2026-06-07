@@ -4,6 +4,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"strings"
 )
 
 func envDefault(key, fallback string) string {
@@ -45,12 +46,14 @@ func maybeAutoSetup(creds *credentials) {
 	if !creds.setupRequired() {
 		return
 	}
-	user := os.Getenv(EnvUser)
+	user := strings.TrimSpace(os.Getenv(EnvUser))
 	pass := os.Getenv(EnvPassword)
 	if user == "" || pass == "" {
 		return
 	}
 	if err := creds.set(user, pass); err != nil {
 		log.Printf("auto-setup credentials failed: %v", err)
+		return
 	}
+	log.Printf("auto-setup created admin user %q", user)
 }

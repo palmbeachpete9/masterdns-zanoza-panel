@@ -79,6 +79,7 @@ func main() {
 		signal.Notify(ch, syscall.SIGHUP)
 		for range ch {
 			if reloaded, err := loadConfig(*configPath); err == nil {
+				applyEnvOverrides(reloaded)
 				srv.mu.Lock()
 				srv.cfg = reloaded
 				srv.mu.Unlock()

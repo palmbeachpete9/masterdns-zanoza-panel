@@ -1,4 +1,4 @@
-.PHONY: lint fmt test build check
+.PHONY: lint fmt test build test-ci check
 
 # ── Configuration ─────────────────────────────────────────────
 GO        := go
@@ -15,7 +15,8 @@ fmt:
 
 # ── test ──────────────────────────────────────────────────────
 test:
-	-$(GO) test -race -count=1 ./...
+	$(GO) test -race -count=1 ./...
+test-ci: test
 
 # ── build ─────────────────────────────────────────────────────
 build:

@@ -3,18 +3,20 @@ package main
 import (
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEnvDefault(t *testing.T) {
 	const key = "TEST_ENV_DEFAULT_KEY"
 
-	if got := envDefault(key, "fallback"); got != "fallback" {
-		t.Fatalf("expected fallback, got %q", got)
-	}
+	got := envDefault(key, "fallback")
+	assert.Equal(t, "fallback", got)
+
 	t.Setenv(key, "from-env")
-	if got := envDefault(key, "fallback"); got != "from-env" {
-		t.Fatalf("expected from-env, got %q", got)
-	}
+	got = envDefault(key, "fallback")
+	assert.Equal(t, "from-env", got)
 }
 
 func TestApplyEnvOverrides(t *testing.T) {
@@ -26,52 +28,31 @@ func TestApplyEnvOverrides(t *testing.T) {
 		cfg := &Config{PanelAddr: "0.0.0.0", PanelPath: "/admin", Name: "Default"}
 		applyEnvOverrides(cfg)
 
-		if cfg.PanelAddr != "10.0.0.1" {
-			t.Fatalf("PanelAddr: got %q", cfg.PanelAddr)
-		}
-		if cfg.PanelPath != "/secret" {
-			t.Fatalf("PanelPath: got %q", cfg.PanelPath)
-		}
-		if cfg.Name != "test-server" {
-			t.Fatalf("Name: got %q", cfg.Name)
-		}
+		assert.Equal(t, "10.0.0.1", cfg.PanelAddr)
+		assert.Equal(t, "/secret", cfg.PanelPath)
+		assert.Equal(t, "test-server", cfg.Name)
 	})
 
-	t.Run("port valid", func(t *testing.T) {
-		t.Setenv(EnvPanelPort, "9090")
-		cfg := &Config{PanelPort: 8443}
-		applyEnvOverrides(cfg)
-		if cfg.PanelPort != 9090 {
-			t.Fatalf("PanelPort: got %d", cfg.PanelPort)
-		}
-	})
+	tests := []struct {
+		name     string
+		env      string
+		initial  int
+		expected int
+	}{
+		{"valid", "9090", 8443, 9090},
+		{"invalid string", "not-a-number", 8443, 8443},
+		{"zero", "0", 8443, 8443},
+		{"too large", "65536", 8443, 8443},
+	}
 
-	t.Run("port invalid keeps default", func(t *testing.T) {
-		t.Setenv(EnvPanelPort, "not-a-number")
-		cfg := &Config{PanelPort: 8443}
-		applyEnvOverrides(cfg)
-		if cfg.PanelPort != 8443 {
-			t.Fatalf("PanelPort should stay default, got %d", cfg.PanelPort)
-		}
-	})
-
-	t.Run("port zero keeps default", func(t *testing.T) {
-		t.Setenv(EnvPanelPort, "0")
-		cfg := &Config{PanelPort: 8443}
-		applyEnvOverrides(cfg)
-		if cfg.PanelPort != 8443 {
-			t.Fatalf("PanelPort should stay default, got %d", cfg.PanelPort)
-		}
-	})
-
-	t.Run("port 65536 keeps default", func(t *testing.T) {
-		t.Setenv(EnvPanelPort, "65536")
-		cfg := &Config{PanelPort: 8443}
-		applyEnvOverrides(cfg)
-		if cfg.PanelPort != 8443 {
-			t.Fatalf("PanelPort should stay default, got %d", cfg.PanelPort)
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(EnvPanelPort, tt.env)
+			cfg := &Config{PanelPort: tt.initial}
+			applyEnvOverrides(cfg)
+			assert.Equal(t, tt.expected, cfg.PanelPort)
+		})
+	}
 }
 
 func TestMaybeAutoSetup(t *testing.T) {
@@ -79,23 +60,15 @@ func TestMaybeAutoSetup(t *testing.T) {
 	envPath := filepath.Join(dir, "panel.env")
 	creds := loadCredentials(envPath)
 
-	if !creds.setupRequired() {
-		t.Fatal("fresh creds should require setup")
-	}
+	require.True(t, creds.setupRequired(), "fresh creds should require setup")
 
 	maybeAutoSetup(creds)
-	if !creds.setupRequired() {
-		t.Fatal("setup should still be required without env vars")
-	}
+	require.True(t, creds.setupRequired(), "setup should still be required without env vars")
 
 	t.Setenv(EnvUser, "admin")
 	t.Setenv(EnvPassword, "secret123")
 
 	maybeAutoSetup(creds)
-	if creds.setupRequired() {
-		t.Fatal("setup should be completed after auto-setup")
-	}
-	if !creds.verify("admin", "secret123") {
-		t.Fatal("credentials should verify after auto-setup")
-	}
+	require.False(t, creds.setupRequired(), "setup should be completed after auto-setup")
+	require.True(t, creds.verify("admin", "secret123"), "credentials should verify after auto-setup")
 }
