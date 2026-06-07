@@ -5,12 +5,15 @@
 package main
 
 import (
+	"crypto/tls"
 	"embed"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,6 +32,7 @@ type server struct {
 	cfg      *Config
 	creds    *credentials
 	sessions *sessionStore
+	limiter  *loginLimiter
 	manager  *serverManager
 	webFS    fs.FS
 	useTLS   bool
@@ -55,12 +59,31 @@ func main() {
 		log.Fatalf("embed web: %v", err)
 	}
 
-	useTLS := cfg.TLSCert != "" && cfg.TLSKey != "" && fileExists(cfg.TLSCert) && fileExists(cfg.TLSKey)
+	// TLS mode is explicit and fail-closed (F05): if certificate paths are
+	// configured, the key pair MUST load before we listen. We never silently
+	// downgrade to plaintext because a file is missing/unreadable.
+	tlsConfigured := cfg.TLSCert != "" || cfg.TLSKey != ""
+	useTLS := false
+	if tlsConfigured {
+		if cfg.TLSCert == "" || cfg.TLSKey == "" {
+			log.Fatalf("TLS misconfigured: both tls_cert and tls_key are required")
+		}
+		if _, err := tls.LoadX509KeyPair(cfg.TLSCert, cfg.TLSKey); err != nil {
+			log.Fatalf("TLS enabled but key pair failed to load: %v", err)
+		}
+		useTLS = true
+	}
+	// Refuse to serve plaintext on a public interface unless explicitly
+	// overridden, so credentials can't accidentally travel in the clear (F05/F03).
+	if !useTLS && !isLoopbackAddr(cfg.PanelAddr) && os.Getenv("ZANOZA_ALLOW_INSECURE") != "1" {
+		log.Fatalf("refusing to serve plaintext HTTP on public address %q; configure TLS or set ZANOZA_ALLOW_INSECURE=1", cfg.PanelAddr)
+	}
 
 	srv := &server{
 		cfg:      cfg,
 		creds:    creds,
 		sessions: newSessionStore(),
+		limiter:  newLoginLimiter(8, 5*time.Minute),
 		manager:  manager,
 		webFS:    webRoot,
 		useTLS:   useTLS,
@@ -96,7 +119,11 @@ func main() {
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
-		ReadHeaderTimeout: 15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       20 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 16,
 	}
 
 	scheme := "http"
@@ -115,9 +142,15 @@ func main() {
 	}
 }
 
-func fileExists(path string) bool {
-	st, err := os.Stat(path)
-	return err == nil && !st.IsDir()
+func isLoopbackAddr(addr string) bool {
+	switch addr {
+	case "", "127.0.0.1", "::1", "localhost":
+		return true
+	}
+	if ip := net.ParseIP(addr); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 // route dispatches by the configured panel path; everything outside it is a
@@ -231,9 +264,39 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	_, _ = w.Write([]byte(msg))
 }
 
-func decodeJSON(r *http.Request, v any) error {
-	defer func() { _ = r.Body.Close() }()
-	return json.NewDecoder(r.Body).Decode(v)
+// maxJSONBody caps unauthenticated/authenticated JSON request bodies so a slow
+// or oversized body cannot exhaust memory (F08).
+const maxJSONBody = 1 << 16 // 64 KiB
+
+// errBodyTooLarge distinguishes a size-cap hit (413) from a parse error (400).
+type errBodyTooLarge struct{ error }
+
+// readJSON decodes a single JSON object from the request body with a hard size
+// cap and rejects trailing data after the first value (F08). It must be given
+// the ResponseWriter so http.MaxBytesReader can abort an oversized stream.
+func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			return errBodyTooLarge{err}
+		}
+		return err
+	}
+	if dec.More() {
+		return fmt.Errorf("unexpected trailing JSON")
+	}
+	return nil
+}
+
+// writeBadBody turns a readJSON error into the right status code.
+func writeBadBody(w http.ResponseWriter, err error) {
+	if _, ok := err.(errBodyTooLarge); ok {
+		writeErr(w, http.StatusRequestEntityTooLarge, "request body too large")
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "bad request")
 }
 
 // ---------------------------------------------------------------------------
@@ -243,13 +306,21 @@ func decodeJSON(r *http.Request, v any) error {
 const sessionCookie = "zanoza_session"
 
 func (s *server) authenticated(r *http.Request) bool {
+	// Cookie sessions only. HTTP Basic was removed because it bypassed the
+	// login endpoint's rate limiting, offering an un-throttled credential
+	// guessing oracle (F07).
 	if c, err := r.Cookie(sessionCookie); err == nil && s.sessions.valid(c.Value) {
 		return true
 	}
-	if user, pass, ok := r.BasicAuth(); ok && s.creds.verify(user, pass) {
-		return true
-	}
 	return false
+}
+
+// clientIP extracts the remote host for rate-limit keying.
+func clientIP(r *http.Request) string {
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
@@ -287,34 +358,61 @@ func (s *server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if !s.creds.setupRequired() {
 		writeErr(w, http.StatusForbidden, "уже настроено")
 		return
 	}
 	var body struct{ User, Password string }
-	if err := decodeJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
+	if err := readJSON(w, r, &body); err != nil {
+		writeBadBody(w, err)
 		return
 	}
-	if err := s.creds.set(strings.TrimSpace(body.User), body.Password); err != nil {
+	// createInitial is the single transactional bootstrap: concurrent setup
+	// requests resolve to exactly one owner (F03).
+	if err := s.creds.createInitial(strings.TrimSpace(body.User), body.Password); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.setSessionCookie(w, s.sessions.create())
+	token, err := s.sessions.create()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "session error")
+		return
+	}
+	s.setSessionCookie(w, token)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
 func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	limitKey := clientIP(r)
+	if !s.limiter.allowed(limitKey) {
+		writeErr(w, http.StatusTooManyRequests, "слишком много попыток, попробуйте позже")
+		return
+	}
 	var body struct{ User, Password string }
-	if err := decodeJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
+	if err := readJSON(w, r, &body); err != nil {
+		writeBadBody(w, err)
 		return
 	}
 	if !s.creds.verify(strings.TrimSpace(body.User), body.Password) {
+		s.limiter.fail(limitKey)
 		writeErr(w, http.StatusUnauthorized, "неверный логин или пароль")
 		return
 	}
-	s.setSessionCookie(w, s.sessions.create())
+	s.limiter.reset(limitKey)
+	token, err := s.sessions.create()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "session error")
+		return
+	}
+	s.setSessionCookie(w, token)
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -327,9 +425,13 @@ func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost && r.Method != http.MethodPut {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	var body struct{ Current, Password string }
-	if err := decodeJSON(r, &body); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
+	if err := readJSON(w, r, &body); err != nil {
+		writeBadBody(w, err)
 		return
 	}
 	if !s.creds.verify(s.creds.username(), body.Current) {
@@ -340,9 +442,9 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil {
-		s.sessions.revoke(c.Value)
-	}
+	// A password change invalidates every existing session (F07).
+	s.sessions.revokeAll()
+	s.setSessionCookie(w, "")
 	writeJSON(w, map[string]any{"ok": true})
 }
 
@@ -356,9 +458,8 @@ type instanceView struct {
 }
 
 func (s *server) handleState(w http.ResponseWriter, _ *http.Request) {
-	s.mu.Lock()
-	cfg := s.cfg
-	s.mu.Unlock()
+	cfg := s.config()
+	meta := cfg.Meta() // locked snapshot; never read mutable fields directly (F12)
 
 	instances := cfg.snapshot()
 	views := make([]instanceView, 0, len(instances))
@@ -369,13 +470,21 @@ func (s *server) handleState(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	writeJSON(w, map[string]any{
-		"name":           cfg.Name,
-		"panel_path":     cfg.PanelPath,
+		"name":           meta.Name,
+		"panel_path":     meta.PanelPath,
 		"domain_count":   len(domains),
 		"instance_count": len(instances),
 		"server":         s.manager.state(),
 		"instances":      views,
 	})
+}
+
+// config returns the currently-published *Config under the server lock, so a
+// SIGHUP reload swapping s.cfg never races with a handler reading it (F12).
+func (s *server) config() *Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
 }
 
 func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
@@ -390,21 +499,20 @@ func (s *server) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	s.mu.Lock()
-	cfg := s.cfg
-	s.mu.Unlock()
+	cfg := s.config()
 
 	switch r.Method {
 	case http.MethodGet:
+		meta := cfg.Meta()
 		writeJSON(w, map[string]any{
-			"name":       cfg.Name,
-			"panel_path": cfg.PanelPath,
+			"name":       meta.Name,
+			"panel_path": meta.PanelPath,
 			"admin_user": s.creds.username(),
 		})
 	case http.MethodPut:
 		var body struct{ Name string }
-		if err := decodeJSON(r, &body); err != nil {
-			writeErr(w, http.StatusBadRequest, "bad request")
+		if err := readJSON(w, r, &body); err != nil {
+			writeBadBody(w, err)
 			return
 		}
 		cfg.mu.Lock()
@@ -434,12 +542,15 @@ func (s *server) handleInstancesCollection(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	var in Instance
-	if err := decodeJSON(r, &in); err != nil {
-		writeErr(w, http.StatusBadRequest, "bad request")
+	if err := readJSON(w, r, &in); err != nil {
+		writeBadBody(w, err)
 		return
 	}
 	in.ID = newInstanceID()
 	in.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	if d, err := canonicalDomain(in.Domain); err == nil {
+		in.Domain = d // store canonical form (F06)
+	}
 	if err := s.mutateInstances(func(list []Instance) ([]Instance, error) {
 		if err := validateInstance(list, in, ""); err != nil {
 			return nil, err
@@ -456,8 +567,8 @@ func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id s
 	switch r.Method {
 	case http.MethodPut:
 		var in Instance
-		if err := decodeJSON(r, &in); err != nil {
-			writeErr(w, http.StatusBadRequest, "bad request")
+		if err := readJSON(w, r, &in); err != nil {
+			writeBadBody(w, err)
 			return
 		}
 		if err := s.mutateInstances(func(list []Instance) ([]Instance, error) {
@@ -470,6 +581,9 @@ func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id s
 			updated.Domain = in.Domain
 			updated.Key = in.Key
 			updated.Method = in.Method
+			if d, err := canonicalDomain(updated.Domain); err == nil {
+				updated.Domain = d // store canonical form (F06)
+			}
 			if err := validateInstance(list, updated, id); err != nil {
 				return nil, err
 			}
@@ -502,7 +616,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if err := s.manager.restart(s.cfg.snapshot()); err != nil {
+	if err := s.manager.restart(s.config().snapshot()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -510,7 +624,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
-	if err := s.manager.apply(s.cfg.snapshot()); err != nil {
+	if err := s.manager.apply(s.config().snapshot()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -563,9 +677,9 @@ func indexOfInstance(list []Instance, id string) int {
 //   - a domain holding 2+ keys must use AEAD for ALL of them (XOR/None can't
 //     be disambiguated by the server when several keys share a domain).
 func validateInstance(list []Instance, in Instance, selfID string) error {
-	domain := strings.TrimSpace(strings.ToLower(in.Domain))
-	if domain == "" || !strings.Contains(domain, ".") {
-		return fmt.Errorf("укажите корректный делегированный домен (например v.example.com)")
+	domain, err := canonicalDomain(in.Domain)
+	if err != nil {
+		return err
 	}
 	if strings.TrimSpace(in.Key) == "" {
 		return fmt.Errorf("ключ обязателен")

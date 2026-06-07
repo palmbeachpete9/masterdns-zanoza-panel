@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -36,12 +37,40 @@ type Config struct {
 
 func defaultConfig() *Config {
 	return &Config{
-		Version:   1,
-		Name:      "Zanoza Panel",
-		PanelAddr: "0.0.0.0",
+		Version: 1,
+		Name:    "Zanoza Panel",
+		// Default to loopback: a config-less first start must never expose an
+		// unauthenticated setup surface to the whole network (F03). The
+		// installer writes an explicit bind address for production.
+		PanelAddr: "127.0.0.1",
 		PanelPort: 8443,
 		PanelPath: "/admin",
 		Instances: []Instance{},
+	}
+}
+
+// ConfigMeta is an immutable snapshot of the live panel settings, taken under
+// lock so HTTP handlers never read mutable Config fields concurrently with a
+// settings update or a SIGHUP reload (F12).
+type ConfigMeta struct {
+	Name      string
+	PanelAddr string
+	PanelPort int
+	PanelPath string
+	TLSCert   string
+	TLSKey    string
+}
+
+func (c *Config) Meta() ConfigMeta {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return ConfigMeta{
+		Name:      c.Name,
+		PanelAddr: c.PanelAddr,
+		PanelPort: c.PanelPort,
+		PanelPath: c.PanelPath,
+		TLSCert:   c.TLSCert,
+		TLSKey:    c.TLSKey,
 	}
 }
 
@@ -71,18 +100,48 @@ func (c *Config) normalize() {
 	if c.Version == 0 {
 		c.Version = 1
 	}
-	if c.PanelPath == "" {
+	if p, err := normalizePanelPath(c.PanelPath); err == nil {
+		c.PanelPath = p
+	} else {
 		c.PanelPath = "/admin"
-	}
-	if c.PanelPath[0] != '/' {
-		c.PanelPath = "/" + c.PanelPath
 	}
 	if c.Name == "" {
 		c.Name = "Zanoza Panel"
 	}
+	if c.PanelAddr == "" {
+		c.PanelAddr = "127.0.0.1"
+	}
 	if c.Instances == nil {
 		c.Instances = []Instance{}
 	}
+}
+
+// normalizePanelPath returns the canonical admin path or an error. It enforces
+// exactly one leading slash, forbids the bare root "/", forbids a trailing
+// slash, and rejects whitespace/control/query/fragment characters and nested
+// slashes — all of which previously produced router redirect loops such as
+// "/" -> "//" or "/admin/" -> "/admin//" (F14).
+func normalizePanelPath(raw string) (string, error) {
+	p := strings.TrimSpace(raw)
+	if p == "" {
+		return "", fmt.Errorf("путь панели обязателен")
+	}
+	if p[0] != '/' {
+		p = "/" + p
+	}
+	p = "/" + strings.Trim(p, "/") // collapse leading/trailing slashes
+	if p == "/" {
+		return "", fmt.Errorf("путь панели не может быть корнем «/»")
+	}
+	if strings.Contains(p[1:], "/") {
+		return "", fmt.Errorf("путь панели не должен содержать вложенных слешей")
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f || r == ' ' || r == '?' || r == '#' || r == '%' {
+			return "", fmt.Errorf("путь панели содержит недопустимый символ")
+		}
+	}
+	return p, nil
 }
 
 func (c *Config) save() error {
@@ -100,11 +159,9 @@ func (c *Config) save() error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	// Atomic + durable write via a unique temp file, so concurrent saves no
+	// longer race on one shared "config.json.tmp" path (F13).
+	return writeFileAtomic(path, raw, 0o600)
 }
 
 // snapshot returns a copy of the instance list under lock.

@@ -42,18 +42,31 @@ type RuntimeState struct {
 // serverManager supervises the single MasterDnsVPN server process and keeps
 // keyring.json in sync with the panel instances.
 type serverManager struct {
-	mu           sync.Mutex
-	binary       string
-	runtimeDir   string
-	keyringPath  string
-	configPath   string
+	mu          sync.Mutex
+	applyMu     sync.Mutex // serializes the full apply/restart pipeline (F04)
+	binary      string
+	runtimeDir  string
+	keyringPath string
+	configPath  string
+
 	cmd          *exec.Cmd
 	pid          int
+	done         chan struct{} // closed by reap when cmd exits
 	startedAt    time.Time
 	exitedAt     time.Time
 	exitErr      string
 	lastApplyErr string
+
+	desiredUp bool      // operator intent: should the server be running?
+	restarts  int       // auto-restarts within the current crash window
+	windowAt  time.Time // start of the current crash-loop window
 }
+
+const (
+	crashWindow    = 60 * time.Second
+	maxRestarts    = 5
+	restartBackoff = 2 * time.Second
+)
 
 func newServerManager(runtimeDir string) *serverManager {
 	bin := envDefault(EnvMasterdnsBin, "/usr/local/bin/masterdns-server")
@@ -83,7 +96,9 @@ func (m *serverManager) writeKeyring(instances []Instance) error {
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(m.keyringPath, raw, 0o600); err != nil {
+	// Atomic write so the server (which may reload concurrently on SIGHUP)
+	// never reads a half-written keyring.json (F04).
+	if err := writeFileAtomic(m.keyringPath, raw, 0o600); err != nil {
 		return err
 	}
 	return m.ensureServerConfig()
@@ -126,27 +141,41 @@ UDP_PORT = %s
 DNS_UPSTREAM_SERVERS = %s
 LOG_LEVEL = "INFO"
 `, keyringPath, dnsHost, dnsPort, dnsUpstream)
-	return os.WriteFile(m.configPath, []byte(tmpl), 0o644)
+	return writeFileAtomic(m.configPath, []byte(tmpl), 0o644)
 }
 
-// apply syncs the keyring then reloads or (re)starts the server.
+// apply renders the keyring then reloads or (re)starts the server. The whole
+// pipeline is serialized under applyMu so concurrent CRUD can never interleave
+// renders/reloads, and signal/start failures are returned to the caller (F04).
 func (m *serverManager) apply(instances []Instance) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
+
 	if err := m.writeKeyring(instances); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	running := m.cmd != nil && m.cmd.Process != nil && m.pid != 0
-	pid := m.pid
-	m.mu.Unlock()
 
 	if len(instances) == 0 {
 		// Nothing to serve; stop the process if it's up.
 		m.stop()
 		return nil
 	}
+
+	m.mu.Lock()
+	running := m.cmd != nil && m.pid != 0
+	pid := m.pid
+	m.desiredUp = true
+	m.mu.Unlock()
+
 	if running {
-		// Ask the server to reload keyring.json in place.
-		_ = syscall.Kill(pid, syscall.SIGHUP)
+		// Ask the server to reload keyring.json in place; surface a dead-PID
+		// or permission failure instead of silently swallowing it.
+		if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
+			m.mu.Lock()
+			m.lastApplyErr = "reload signal failed: " + err.Error()
+			m.mu.Unlock()
+			return fmt.Errorf("reload (SIGHUP pid %d) failed: %w", pid, err)
+		}
 		return nil
 	}
 	return m.start()
@@ -155,7 +184,12 @@ func (m *serverManager) apply(instances []Instance) error {
 func (m *serverManager) start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.cmd != nil && m.cmd.Process != nil {
+	return m.startLocked()
+}
+
+// startLocked launches the server. Caller holds m.mu.
+func (m *serverManager) startLocked() error {
+	if m.cmd != nil && m.pid != 0 {
 		return nil
 	}
 	if _, err := os.Stat(m.binary); err != nil {
@@ -169,58 +203,99 @@ func (m *serverManager) start() error {
 		m.lastApplyErr = err.Error()
 		return err
 	}
+	done := make(chan struct{})
 	m.cmd = cmd
 	m.pid = cmd.Process.Pid
+	m.done = done
 	m.startedAt = time.Now()
 	m.exitErr = ""
 	m.lastApplyErr = ""
-	go m.reap(cmd)
+	m.desiredUp = true
+	go m.reap(cmd, done)
 	return nil
 }
 
-func (m *serverManager) reap(cmd *exec.Cmd) {
+// reap is the single owner of cmd.Wait() for one process generation. On an
+// unexpected exit (operator still wants it up) it auto-restarts with bounded
+// backoff and a crash-loop ceiling; a deliberate stop is not restarted (F09).
+func (m *serverManager) reap(cmd *exec.Cmd, done chan struct{}) {
 	err := cmd.Wait()
+	close(done)
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if m.cmd == cmd {
-		m.cmd = nil
-		m.pid = 0
-		m.exitedAt = time.Now()
-		if err != nil {
-			m.exitErr = err.Error()
-		}
+	if m.cmd != cmd {
+		// Superseded by a newer generation; do not clobber its state.
+		m.mu.Unlock()
+		return
 	}
+	m.cmd = nil
+	m.pid = 0
+	m.exitedAt = time.Now()
+	if err != nil {
+		m.exitErr = err.Error()
+	}
+	if !m.desiredUp {
+		m.mu.Unlock()
+		return // deliberate stop
+	}
+
+	now := time.Now()
+	if now.Sub(m.windowAt) > crashWindow {
+		m.windowAt = now
+		m.restarts = 0
+	}
+	m.restarts++
+	if m.restarts > maxRestarts {
+		m.lastApplyErr = fmt.Sprintf("masterdns crash loop: %d restarts within %s; supervisor stopped", m.restarts, crashWindow)
+		m.desiredUp = false
+		m.mu.Unlock()
+		log.Printf("masterdns: %s", m.lastApplyErr)
+		return
+	}
+	backoff := time.Duration(m.restarts) * restartBackoff
+	m.mu.Unlock()
+
+	log.Printf("masterdns exited (%v); auto-restart in %s (attempt %d/%d)", err, backoff, m.restarts, maxRestarts)
+	go func() {
+		time.Sleep(backoff)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if !m.desiredUp || m.cmd != nil {
+			return
+		}
+		if err := m.startLocked(); err != nil {
+			log.Printf("masterdns auto-restart failed: %v", err)
+		}
+	}()
 }
 
 func (m *serverManager) stop() {
 	m.mu.Lock()
+	m.desiredUp = false
 	cmd := m.cmd
 	pid := m.pid
+	done := m.done
 	m.mu.Unlock()
 	if cmd == nil || pid == 0 {
 		return
 	}
 	_ = syscall.Kill(pid, syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() {
-		_ = cmd.Wait()
-		close(done)
-	}()
+	if done == nil {
+		return
+	}
+	// Wait for reap (the sole cmd.Wait owner) to observe the exit. No second
+	// Wait is ever issued, avoiding the previous double-Wait race (F09).
 	select {
 	case <-done:
 	case <-time.After(8 * time.Second):
 		_ = cmd.Process.Kill()
+		<-done
 	}
-	m.mu.Lock()
-	if m.cmd == cmd {
-		m.cmd = nil
-		m.pid = 0
-		m.exitedAt = time.Now()
-	}
-	m.mu.Unlock()
 }
 
 func (m *serverManager) restart(instances []Instance) error {
+	m.applyMu.Lock()
+	defer m.applyMu.Unlock()
 	m.stop()
 	if len(instances) == 0 {
 		return nil
