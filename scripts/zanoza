@@ -41,7 +41,9 @@ panel_url(){
 	printf '%s://%s:%s%s\n' "$scheme" "$host" "$port" "$path"
 }
 
-random_alnum(){ tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"; }
+# `|| true` swallows the SIGPIPE (141) `tr` gets when `head` closes the pipe,
+# which would otherwise abort the script under `set -o pipefail`.
+random_alnum(){ LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "$1" || true; }
 
 cmd_help(){
 cat <<EOF

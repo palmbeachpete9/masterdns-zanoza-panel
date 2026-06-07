@@ -41,7 +41,10 @@ random_port() {
 	done
 	printf '8443'
 }
-random_alnum() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$1"; }
+# `tr` keeps writing to the endless /dev/urandom after `head` closes the pipe,
+# so under `set -o pipefail` the SIGPIPE (141) would abort the script. The
+# trailing `|| true` swallows it; the N chars are already on stdout.
+random_alnum() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "$1" || true; }
 
 # --------------------------------------------------------------------------
 # Packages + Go
