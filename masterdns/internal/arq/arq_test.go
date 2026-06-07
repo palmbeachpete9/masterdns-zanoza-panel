@@ -42,7 +42,7 @@ func NewMockPacketEnqueuer() *MockPacketEnqueuer {
 	}
 }
 
-func (m *MockPacketEnqueuer) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, ttl time.Duration, payload []byte) bool {
+func (m *MockPacketEnqueuer) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID, totalFragments, compressionType uint8, ttl time.Duration, payload []byte) bool {
 	m.mu.Lock()
 	if packetType == Enums.PACKET_STREAM_DATA_NACK {
 		m.queuedNackSeqs[sequenceNum] = struct{}{}
@@ -80,7 +80,7 @@ func (m *MockPacketEnqueuer) RemoveQueuedDataNack(sequenceNum uint16) bool {
 	return true
 }
 
-func (RejectingPacketEnqueuer) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, ttl time.Duration, payload []byte) bool {
+func (RejectingPacketEnqueuer) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID, totalFragments, compressionType uint8, ttl time.Duration, payload []byte) bool {
 	return false
 }
 

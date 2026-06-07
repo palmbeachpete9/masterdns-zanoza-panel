@@ -13,30 +13,39 @@ import (
 )
 
 type Store[K comparable] struct {
-	mu        sync.Mutex
-	items     map[K]*entry
-	completed map[K]time.Time
-	lastPurge time.Time
+	mu           sync.Mutex
+	items        map[K]*entry
+	completed    map[K]time.Time
+	lastPurge    time.Time
+	maxPartial   int // hard cap on in-progress reassemblies (F18)
+	maxCompleted int // hard cap on completion markers (F18)
 }
 
 type entry struct {
 	createdAt      time.Time
 	totalFragments uint8
-	chunks         [256][]byte
-	count          uint8
+	// chunks is sized to totalFragments, not a fixed [256][]byte — a flood of
+	// single-/few-fragment partials no longer carries 256 slice headers (~6 KB)
+	// of overhead each (F18).
+	chunks []byte2D
+	count  uint8
 }
+
+type byte2D = []byte
 
 func New[K comparable](capacity int) *Store[K] {
 	if capacity < 1 {
 		capacity = 16
 	}
 	return &Store[K]{
-		items:     make(map[K]*entry, capacity),
-		completed: make(map[K]time.Time, capacity),
+		items:        make(map[K]*entry, capacity),
+		completed:    make(map[K]time.Time, capacity),
+		maxPartial:   capacity,
+		maxCompleted: capacity,
 	}
 }
 
-func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragments uint8, now time.Time, retention time.Duration) ([]byte, bool, bool) {
+func (s *Store[K]) Collect(key K, payload []byte, fragmentID, totalFragments uint8, now time.Time, retention time.Duration) ([]byte, bool, bool) {
 	if totalFragments <= 1 {
 		if retention <= 0 {
 			return append([]byte(nil), payload...), true, false
@@ -54,6 +63,9 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragmen
 		}
 
 		delete(s.items, key)
+		if _, exists := s.completed[key]; !exists && len(s.completed) >= s.maxCompleted {
+			s.evictOldestCompletedLocked()
+		}
 		s.completed[key] = now.Add(retention)
 		return append([]byte(nil), payload...), true, false
 	}
@@ -76,9 +88,15 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragmen
 
 	current, ok := s.items[key]
 	if !ok || current.totalFragments != totalFragments {
+		if !ok && len(s.items) >= s.maxPartial {
+			// Bound memory: drop the oldest in-progress reassembly so a flood
+			// of unique keys cannot grow the store without limit (F18).
+			s.evictOldestPartialLocked()
+		}
 		current = &entry{
 			createdAt:      now,
 			totalFragments: totalFragments,
+			chunks:         make([]byte2D, totalFragments),
 		}
 		s.items[key] = current
 	}
@@ -109,11 +127,48 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID uint8, totalFragmen
 
 	delete(s.items, key)
 	if retention > 0 {
+		if _, exists := s.completed[key]; !exists && len(s.completed) >= s.maxCompleted {
+			s.evictOldestCompletedLocked()
+		}
 		s.completed[key] = now.Add(retention)
 	} else {
 		delete(s.completed, key)
 	}
 	return assembled, true, false
+}
+
+// evictOldestPartialLocked deletes the oldest in-progress entry. Caller holds mu.
+func (s *Store[K]) evictOldestPartialLocked() {
+	var oldestKey K
+	var oldest time.Time
+	found := false
+	for k, e := range s.items {
+		if e == nil {
+			delete(s.items, k)
+			return
+		}
+		if !found || e.createdAt.Before(oldest) {
+			oldest, oldestKey, found = e.createdAt, k, true
+		}
+	}
+	if found {
+		delete(s.items, oldestKey)
+	}
+}
+
+// evictOldestCompletedLocked deletes the earliest-expiring marker. Caller holds mu.
+func (s *Store[K]) evictOldestCompletedLocked() {
+	var oldestKey K
+	var oldest time.Time
+	found := false
+	for k, exp := range s.completed {
+		if !found || exp.Before(oldest) {
+			oldest, oldestKey, found = exp, k, true
+		}
+	}
+	if found {
+		delete(s.completed, oldestKey)
+	}
 }
 
 func (s *Store[K]) Purge(now time.Time, retention time.Duration) {

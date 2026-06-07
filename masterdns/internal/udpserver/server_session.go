@@ -89,7 +89,7 @@ func (s *Server) handleSessionCloseNotice(vpnPacket VpnProto.Packet, now time.Ti
 	}
 }
 
-func (s *Server) logInvalidSessionDrop(reason string, sessionID uint8, receivedCookie uint8, expectedCookie uint8, responseMode uint8) {
+func (s *Server) logInvalidSessionDrop(reason string, sessionID, receivedCookie, expectedCookie, responseMode uint8) {
 	if !s.debugLoggingEnabled() {
 		return
 	}
@@ -118,7 +118,7 @@ func (s *Server) logInvalidSessionDrop(reason string, sessionID uint8, receivedC
 	)
 }
 
-func invalidSessionDropLogConfig(reason string, sessionID uint8, receivedCookie uint8, expectedCookie uint8, responseMode uint8) (string, time.Duration) {
+func invalidSessionDropLogConfig(reason string, sessionID, receivedCookie, expectedCookie, responseMode uint8) (string, time.Duration) {
 	switch reason {
 	case "recently closed session":
 		return fmt.Sprintf("recently-closed:%d:%d:%d", sessionID, expectedCookie, responseMode), 3 * time.Second
@@ -131,7 +131,7 @@ func invalidSessionDropLogConfig(reason string, sessionID uint8, receivedCookie 
 	}
 }
 
-func (s *Server) buildInvalidSessionErrorResponse(questionPacket []byte, requestName string, sessionID uint8, responseMode uint8) []byte {
+func (s *Server) buildInvalidSessionErrorResponse(questionPacket []byte, requestName string, sessionID, responseMode uint8) []byte {
 	payload := s.nextInvalidDropPayload()
 	response, err := DnsParser.BuildVPNResponsePacket(questionPacket, requestName, VpnProto.Packet{
 		SessionID:  sessionID,
@@ -761,7 +761,7 @@ func (s *Server) handleSessionInitRequest(questionPacket []byte, decision domain
 	return response
 }
 
-func resolveCompressionType(requested uint8, allowedMask uint8) uint8 {
+func resolveCompressionType(requested, allowedMask uint8) uint8 {
 	if requested <= compression.TypeZLIB && allowedMask&(1<<requested) != 0 {
 		return requested
 	}
@@ -784,7 +784,6 @@ func (s *Server) handleMTUUpRequest(questionPacket []byte, _ DnsParser.LitePacke
 		PacketType: Enums.PACKET_MTU_UP_RES,
 		Payload:    responsePayload[:],
 	}, baseEncode)
-
 	if err != nil {
 		return nil
 	}

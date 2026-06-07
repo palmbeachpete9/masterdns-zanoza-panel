@@ -98,7 +98,7 @@ func NormalizeAvailableType(value uint8) uint8 {
 	return value
 }
 
-func PackPair(uploadType uint8, downloadType uint8) uint8 {
+func PackPair(uploadType, downloadType uint8) uint8 {
 	if uploadType > TypeZLIB {
 		uploadType = TypeOff
 	}

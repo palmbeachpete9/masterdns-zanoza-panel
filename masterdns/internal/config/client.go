@@ -538,14 +538,14 @@ func normalizeClientDomains(domains []string) []string {
 	return normalized
 }
 
-func defaultString(value string, fallback string) string {
+func defaultString(value, fallback string) string {
 	if value == "" {
 		return fallback
 	}
 	return value
 }
 
-func defaultIntBelow(value int, minValue int, fallback int) int {
+func defaultIntBelow(value, minValue, fallback int) int {
 	if value < minValue {
 		return fallback
 	}
@@ -1019,7 +1019,7 @@ func (f *clientConfigStringSliceFlag) Set(value string) error {
 	return nil
 }
 
-func clampInt(value int, minValue int, maxValue int) int {
+func clampInt(value, minValue, maxValue int) int {
 	if value < minValue {
 		return minValue
 	}
@@ -1031,7 +1031,7 @@ func clampInt(value int, minValue int, maxValue int) int {
 	return value
 }
 
-func defaultFloatAtMostZero(value float64, fallback float64) float64 {
+func defaultFloatAtMostZero(value, fallback float64) float64 {
 	if value <= 0 {
 		return fallback
 	}
@@ -1039,14 +1039,14 @@ func defaultFloatAtMostZero(value float64, fallback float64) float64 {
 	return value
 }
 
-func defaultFloatBelow(value float64, minValue float64, fallback float64) float64 {
+func defaultFloatBelow(value, minValue, fallback float64) float64 {
 	if value < minValue {
 		return fallback
 	}
 	return value
 }
 
-func clampFloat(value float64, minValue float64, maxValue float64) float64 {
+func clampFloat(value, minValue, maxValue float64) float64 {
 	if value < minValue {
 		return minValue
 	}
@@ -1056,7 +1056,7 @@ func clampFloat(value float64, minValue float64, maxValue float64) float64 {
 	return value
 }
 
-func deriveConfiguredTunnelProcessWorkers(current int, rxWorkers int, explicit bool) int {
+func deriveConfiguredTunnelProcessWorkers(current, rxWorkers int, explicit bool) int {
 	recommended := deriveRecommendedTunnelProcessWorkers(rxWorkers)
 	if explicit {
 		current = clampInt(current, 1, 256)

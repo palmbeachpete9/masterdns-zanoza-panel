@@ -38,7 +38,7 @@ const (
 
 // PacketEnqueuer abstracts the transmission layer (Client or Server stream)
 type PacketEnqueuer interface {
-	PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, ttl time.Duration, payload []byte) bool
+	PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID, totalFragments, compressionType uint8, ttl time.Duration, payload []byte) bool
 }
 
 type terminalOwner interface {
@@ -688,14 +688,14 @@ func (a *ARQ) contiguousReadyLocked() int {
 	return ready
 }
 
-func formatAgoFrom(now time.Time, ts time.Time) string {
+func formatAgoFrom(now, ts time.Time) string {
 	if ts.IsZero() {
 		return "-"
 	}
 	return now.Sub(ts).Round(time.Millisecond).String()
 }
 
-func formatDeadlineDelta(now time.Time, deadline time.Time) string {
+func formatDeadlineDelta(now, deadline time.Time) string {
 	if deadline.IsZero() {
 		return "-"
 	}
@@ -2019,7 +2019,7 @@ func (a *ARQ) noteDataNackSent(sn uint16, now time.Time) {
 	a.mu.Unlock()
 }
 
-func seqBehind(base uint16, candidate uint16) bool {
+func seqBehind(base, candidate uint16) bool {
 	return candidate != base && uint16(base-candidate) < 32768
 }
 
@@ -2112,7 +2112,7 @@ func (a *ARQ) runGapRecoveryWatchdog(now time.Time) {
 // Control Plane Verification
 // ---------------------------------------------------------------------
 
-func (a *ARQ) SendControlPacketWithTTL(packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, payload []byte, priority int, trackForAck bool, customAckType *uint8, ttl time.Duration) bool {
+func (a *ARQ) SendControlPacketWithTTL(packetType uint8, sequenceNum uint16, fragmentID, totalFragments uint8, payload []byte, priority int, trackForAck bool, customAckType *uint8, ttl time.Duration) bool {
 	copyData := append([]byte(nil), payload...)
 	priority = Enums.NormalizePacketPriority(packetType, priority)
 
@@ -2200,7 +2200,7 @@ func (a *ARQ) handleTrackedTerminalAck(originPtype uint8) bool {
 	return false
 }
 
-func (a *ARQ) handleWaitingTerminalAck(ackPacketType uint8, isWaitingCloseRead bool, isWaitingCloseWrite bool, isWaitingRst bool) bool {
+func (a *ARQ) handleWaitingTerminalAck(ackPacketType uint8, isWaitingCloseRead, isWaitingCloseWrite, isWaitingRst bool) bool {
 	if ackPacketType == Enums.PACKET_STREAM_CLOSE_READ_ACK && isWaitingCloseRead {
 		a.markCloseReadAcked()
 		a.clearWaitingAck(Enums.PACKET_STREAM_CLOSE_READ)

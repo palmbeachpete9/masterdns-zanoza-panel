@@ -27,6 +27,11 @@ import (
 
 var ErrSessionTableFull = errors.New("session table full")
 
+// ErrCookieEntropy is returned when the CSPRNG fails while minting a session
+// cookie. The session is refused rather than created with a predictable
+// zero cookie (F28).
+var ErrCookieEntropy = errors.New("cookie entropy unavailable")
+
 const (
 	maxServerSessionID    = 255
 	maxServerSessionSlots = 255
@@ -214,7 +219,7 @@ type sessionStore struct {
 	recentlyClosedCap      int
 }
 
-func newSessionStore(orphanQueueCap int, streamQueueCap int, options ...any) *sessionStore {
+func newSessionStore(orphanQueueCap, streamQueueCap int, options ...any) *sessionStore {
 	if orphanQueueCap < 1 {
 		orphanQueueCap = 8
 	}
@@ -323,7 +328,12 @@ func (s *sessionStore) findOrCreate(
 		maxClientDownloadMTU,
 	)
 	copy(record.VerifyCode[:], payload[6:10])
-	record.Cookie = s.randomCookieLocked()
+	cookie, ok := s.randomCookieLocked()
+	if !ok {
+		// Fail closed: never register a session with a fabricated cookie.
+		return nil, false, ErrCookieEntropy
+	}
+	record.Cookie = cookie
 
 	s.byID[slot] = record
 	s.activeCount++
@@ -401,7 +411,7 @@ func (s *sessionStore) Lookup(sessionID uint8) (sessionLookupResult, bool) {
 	return sessionLookupResult{}, false
 }
 
-func (s *sessionStore) ValidateAndTouch(sessionID uint8, cookie uint8, now time.Time) sessionValidationResult {
+func (s *sessionStore) ValidateAndTouch(sessionID, cookie uint8, now time.Time) sessionValidationResult {
 	s.mu.RLock()
 	if record := s.byID[sessionID]; record != nil {
 		result := sessionValidationResult{
@@ -468,7 +478,7 @@ func (s *sessionStore) Close(sessionID uint8, now time.Time, retention time.Dura
 	return record, true
 }
 
-func (s *sessionStore) Cleanup(now time.Time, idleTimeout time.Duration, closedRetention time.Duration) []closedSessionCleanup {
+func (s *sessionStore) Cleanup(now time.Time, idleTimeout, closedRetention time.Duration) []closedSessionCleanup {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -577,17 +587,20 @@ func (s *sessionStore) allocateSlotLocked() int {
 	return -1
 }
 
-func (s *sessionStore) randomCookieLocked() uint8 {
+// randomCookieLocked returns the next CSPRNG cookie byte and ok=true, or
+// ok=false if the entropy source failed. Callers must fail closed on !ok and
+// never substitute a predictable value (F28).
+func (s *sessionStore) randomCookieLocked() (value uint8, ok bool) {
 	if s.cookieIndex >= len(s.cookieBytes) {
 		if _, err := rand.Read(s.cookieBytes[:]); err != nil {
 			s.cookieIndex = len(s.cookieBytes)
-			return 0
+			return 0, false
 		}
 		s.cookieIndex = 0
 	}
-	value := s.cookieBytes[s.cookieIndex]
+	value = s.cookieBytes[s.cookieIndex]
 	s.cookieIndex++
-	return value
+	return value, true
 }
 
 func (s *sessionStore) updateNextReuseSweepLocked(reuseUntilUnixNano int64) {
@@ -695,7 +708,7 @@ func (r *sessionRecord) applyMTUFromSessionInit(
 	r.MaxPackedBlocks = VpnProto.CalculateMaxPackedBlocks(r.DownloadMTUBytes, 80, maxPacketsPerBatch)
 }
 
-func clampMTUToLimit(value uint16, maxAllowed uint16) uint16 {
+func clampMTUToLimit(value, maxAllowed uint16) uint16 {
 	clamped := clampMTU(value)
 	if clamped > maxAllowed {
 		return maxAllowed
@@ -859,6 +872,7 @@ func (r *sessionRecord) getStream(streamID uint16) (*Stream_server, bool) {
 	r.StreamsMu.RUnlock()
 	return s, ok
 }
+
 func (r *sessionRecord) noteStreamClosed(streamID uint16, now time.Time, suppressOrphan bool) {
 	if r == nil || r.isClosed() || streamID == 0 {
 		return
@@ -1127,7 +1141,7 @@ func orphanResetKey(packetType uint8, streamID uint16) uint64 {
 	return Enums.PacketTypeStreamKey(streamID, packetType)
 }
 
-func (r *sessionRecord) enqueueOrphanReset(packetType uint8, streamID uint16, sequenceNum uint16) {
+func (r *sessionRecord) enqueueOrphanReset(packetType uint8, streamID, sequenceNum uint16) {
 	if r == nil || r.isClosed() || r.OrphanQueue == nil || streamID == 0 {
 		return
 	}

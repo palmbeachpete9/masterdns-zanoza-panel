@@ -37,7 +37,7 @@ func newInvalidCookieTracker() *invalidCookieTracker {
 	}
 }
 
-func (t *invalidCookieTracker) Note(sessionID uint8, lookup sessionLookupResult, known bool, packetCookie uint8, nowUnix int64, windowNanos int64, threshold int) bool {
+func (t *invalidCookieTracker) Note(sessionID uint8, lookup sessionLookupResult, known bool, packetCookie uint8, nowUnix, windowNanos int64, threshold int) bool {
 	if t == nil || windowNanos <= 0 || threshold <= 0 {
 		return false
 	}

@@ -28,7 +28,7 @@ type Manager[T any] struct {
 	items         map[string]*Entry[T]
 }
 
-func New[T any](timeout time.Duration, fallback time.Duration, cloneValue func(T) T) *Manager[T] {
+func New[T any](timeout, fallback time.Duration, cloneValue func(T) T) *Manager[T] {
 	if timeout <= 0 {
 		timeout = fallback
 	}

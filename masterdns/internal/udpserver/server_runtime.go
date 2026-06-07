@@ -161,7 +161,7 @@ func (s *Server) sessionCleanupLoop(ctx context.Context) {
 	}
 }
 
-func (s *Server) deferredIdleCleanupTimeout(cleanupInterval time.Duration, sessionTimeout time.Duration) time.Duration {
+func (s *Server) deferredIdleCleanupTimeout(cleanupInterval, sessionTimeout time.Duration) time.Duration {
 	timeout := s.deferredConnectAttemptTimeout()
 	if timeout <= 0 {
 		timeout = 15 * time.Second
@@ -254,7 +254,7 @@ func (s *Server) safeHandlePacket(packet []byte) (response []byte) {
 	return s.handlePacket(packet)
 }
 
-func (s *Server) onDrop(addr *net.UDPAddr, queueLen int, queueCap int) {
+func (s *Server) onDrop(addr *net.UDPAddr, queueLen, queueCap int) {
 	total := s.droppedPackets.Add(1)
 
 	now := logger.NowUnixNano()

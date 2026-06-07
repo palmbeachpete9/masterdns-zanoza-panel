@@ -250,7 +250,7 @@ func findOPTRecordRange(request []byte, header Header, questionEndOffset int) (i
 	return findFirstOPTRecordInAdditional(request, offset, int(header.ARCount))
 }
 
-func findFirstOPTRecordInAdditional(data []byte, offset int, count int) (int, int) {
+func findFirstOPTRecordInAdditional(data []byte, offset, count int) (int, int) {
 	for range count {
 		recordStart := offset
 
@@ -279,7 +279,7 @@ func findFirstOPTRecordInAdditional(data []byte, offset int, count int) (int, in
 	return 0, 0
 }
 
-func skipQuestions(data []byte, offset int, count int) (int, error) {
+func skipQuestions(data []byte, offset, count int) (int, error) {
 	for range count {
 		nextOffset, err := skipName(data, offset)
 		if err != nil {
@@ -294,7 +294,7 @@ func skipQuestions(data []byte, offset int, count int) (int, error) {
 	return offset, nil
 }
 
-func skipResourceRecords(data []byte, offset int, count int) (int, error) {
+func skipResourceRecords(data []byte, offset, count int) (int, error) {
 	for range count {
 		nextOffset, err := skipName(data, offset)
 		if err != nil {
@@ -316,7 +316,7 @@ func skipResourceRecords(data []byte, offset int, count int) (int, error) {
 	return offset, nil
 }
 
-func extractRawOPTRecords(data []byte, offset int, count int) ([][]byte, int, int, error) {
+func extractRawOPTRecords(data []byte, offset, count int) ([][]byte, int, int, error) {
 	if count == 0 {
 		return nil, 0, offset, nil
 	}

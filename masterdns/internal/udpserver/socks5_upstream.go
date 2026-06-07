@@ -74,32 +74,86 @@ func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, 
 		}
 	}
 
-	if err := validateSOCKSTargetHost(host); err != nil {
+	// Resolve + authorize BEFORE dialing, then pin the connection to the exact
+	// validated IP so a hostname like "localhost." or a rebinding DNS answer
+	// cannot smuggle in a private/loopback/metadata address (F19).
+	pinnedIP, err := s.authorizeSOCKSTarget(ctx, host)
+	if err != nil {
 		return nil, err
 	}
 
 	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
-		return s.dialTCPTargetContext(ctx, net.JoinHostPort(host, strconv.Itoa(int(port))))
+		return s.dialTCPTargetContext(ctx, net.JoinHostPort(pinnedIP, strconv.Itoa(int(port))))
 	}
 	return s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
 }
 
+// validateSOCKSTargetHost is the cheap, no-DNS pre-check used to reject an
+// obviously-blocked target early (before a stream is set up). It catches
+// localhost variants and literal private/loopback IPs; hostnames are passed
+// through here and authoritatively resolved + pinned later by
+// authorizeSOCKSTarget at dial time (F19).
 func validateSOCKSTargetHost(host string) error {
-	trimmed := strings.TrimSpace(host)
-	if trimmed == "" {
+	name := normalizeSOCKSHost(host)
+	if name == "" || name == "localhost" || strings.HasSuffix(name, ".localhost") {
 		return &blockedSOCKSTargetError{host: host}
 	}
-
-	lower := strings.ToLower(trimmed)
-	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") {
+	if ip := net.ParseIP(name); ip != nil && isBlockedTargetIP(ip) {
 		return &blockedSOCKSTargetError{host: host}
 	}
+	return nil
+}
 
-	ip := net.ParseIP(trimmed)
+// normalizeSOCKSHost lowercases and strips one or more trailing root dots so
+// "localhost." and "LocalHost" cannot bypass the loopback check (F19).
+func normalizeSOCKSHost(host string) string {
+	h := strings.ToLower(strings.TrimSpace(host))
+	for strings.HasSuffix(h, ".") {
+		h = h[:len(h)-1]
+	}
+	return h
+}
+
+// authorizeSOCKSTarget returns the concrete IP the dialer must connect to, or a
+// blockedSOCKSTargetError. Literal IPs are validated directly; hostnames are
+// resolved and rejected if ANY resolved address is non-public.
+func (s *Server) authorizeSOCKSTarget(ctx context.Context, host string) (string, error) {
+	name := normalizeSOCKSHost(host)
+	if name == "" || name == "localhost" || strings.HasSuffix(name, ".localhost") {
+		return "", &blockedSOCKSTargetError{host: host}
+	}
+
+	if ip := net.ParseIP(name); ip != nil {
+		if isBlockedTargetIP(ip) {
+			return "", &blockedSOCKSTargetError{host: host}
+		}
+		return ip.String(), nil
+	}
+
+	lookup := s.resolveIPAddrFn
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
+	addrs, err := lookup(ctx, name)
+	if err != nil || len(addrs) == 0 {
+		return "", &blockedSOCKSTargetError{host: host}
+	}
+	for _, a := range addrs {
+		if isBlockedTargetIP(a.IP) {
+			return "", &blockedSOCKSTargetError{host: host}
+		}
+	}
+	return addrs[0].IP.String(), nil
+}
+
+// isBlockedTargetIP reports whether an IP must never be a SOCKS egress target:
+// loopback, private, link-local (incl. cloud metadata 169.254.169.254),
+// multicast, unspecified, CGNAT (100.64/10) and benchmarking (198.18/15),
+// including IPv4-mapped IPv6 forms.
+func isBlockedTargetIP(ip net.IP) bool {
 	if ip == nil {
-		return nil
+		return true
 	}
-
 	if !ip.IsGlobalUnicast() ||
 		ip.IsLoopback() ||
 		ip.IsPrivate() ||
@@ -107,19 +161,17 @@ func validateSOCKSTargetHost(host string) error {
 		ip.IsLinkLocalUnicast() ||
 		ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() {
-		return &blockedSOCKSTargetError{host: host}
+		return true
 	}
-
 	if v4 := ip.To4(); v4 != nil {
-		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 {
-			return &blockedSOCKSTargetError{host: host}
+		if v4[0] == 100 && v4[1] >= 64 && v4[1] <= 127 { // 100.64.0.0/10 CGNAT
+			return true
 		}
-		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) {
-			return &blockedSOCKSTargetError{host: host}
+		if v4[0] == 198 && (v4[1] == 18 || v4[1] == 19) { // 198.18.0.0/15
+			return true
 		}
 	}
-
-	return nil
+	return false
 }
 
 func (s *Server) dialTCPTarget(address string) (net.Conn, error) {
@@ -383,7 +435,7 @@ func writeAll(conn net.Conn, payload []byte) error {
 	return nil
 }
 
-func (s *Server) collectSOCKS5SynFragments(sessionID uint8, streamID uint16, sequenceNum uint16, payload []byte, fragmentID uint8, totalFragments uint8, now time.Time) ([]byte, bool, bool) {
+func (s *Server) collectSOCKS5SynFragments(sessionID uint8, streamID, sequenceNum uint16, payload []byte, fragmentID, totalFragments uint8, now time.Time) ([]byte, bool, bool) {
 	if totalFragments == 0 {
 		totalFragments = 1
 	}

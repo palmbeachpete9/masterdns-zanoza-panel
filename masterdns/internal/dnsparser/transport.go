@@ -35,7 +35,7 @@ const (
 	maxTXTEncodedChunk  = 191
 )
 
-func BuildTXTQuestionPacket(name string, qType uint16, ednsUDPSize uint16) ([]byte, error) {
+func BuildTXTQuestionPacket(name string, qType, ednsUDPSize uint16) ([]byte, error) {
 	qname, err := encodeDNSNameStrict(name)
 	if err != nil {
 		return nil, err
@@ -76,7 +76,7 @@ func BuildTXTQuestionPacket(name string, qType uint16, ednsUDPSize uint16) ([]by
 	return packet, nil
 }
 
-func BuildTunnelTXTQuestionPacket(domain string, encodedFrame []byte, qType uint16, ednsUDPSize uint16) ([]byte, error) {
+func BuildTunnelTXTQuestionPacket(domain string, encodedFrame []byte, qType, ednsUDPSize uint16) ([]byte, error) {
 	normalizedDomain, domainQname, err := PrepareTunnelDomainQname(domain)
 	if err != nil {
 		return nil, err
@@ -85,7 +85,7 @@ func BuildTunnelTXTQuestionPacket(domain string, encodedFrame []byte, qType uint
 	return BuildTunnelTXTQuestionPacketPrepared(normalizedDomain, domainQname, encodedFrame, qType, ednsUDPSize)
 }
 
-func BuildTunnelTXTQuestionPacketPrepared(normalizedDomain string, domainQname []byte, encodedFrame []byte, qType uint16, ednsUDPSize uint16) ([]byte, error) {
+func BuildTunnelTXTQuestionPacketPrepared(normalizedDomain string, domainQname, encodedFrame []byte, qType, ednsUDPSize uint16) ([]byte, error) {
 	if normalizedDomain == "" || len(domainQname) == 0 {
 		return nil, ErrInvalidName
 	}
@@ -155,7 +155,7 @@ func PrepareTunnelDomainQname(domain string) (string, []byte, error) {
 	return normalizedDomain, domainQname, nil
 }
 
-func buildTXTQuestionPacketPrepared(qname []byte, qType uint16, ednsUDPSize uint16) []byte {
+func buildTXTQuestionPacketPrepared(qname []byte, qType, ednsUDPSize uint16) []byte {
 	requestID := nextDNSRequestID()
 
 	arCount := uint16(0)
@@ -265,7 +265,6 @@ func BuildVPNResponsePacket(questionPacket []byte, answerName string, packet Vpn
 		CompressionType: packet.CompressionType,
 		Payload:         packet.Payload,
 	}, compression.DefaultMinSize)
-
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +349,7 @@ func extractFirstQuestionNameWire(packet []byte) ([]byte, string, bool) {
 	return packet[dnsHeaderSize:nextOffset], name, true
 }
 
-func sameDNSName(a string, b string) bool {
+func sameDNSName(a, b string) bool {
 	a = strings.TrimSuffix(a, ".")
 	b = strings.TrimSuffix(b, ".")
 	return strings.EqualFold(a, b)
@@ -460,7 +459,7 @@ func EncodeDataToLabels(data string) string {
 	return b.String()
 }
 
-func BuildTunnelQuestionName(domain string, encodedFrame string) (string, error) {
+func BuildTunnelQuestionName(domain, encodedFrame string) (string, error) {
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
 	if domain == "" {
 		return "", ErrInvalidName
@@ -533,7 +532,7 @@ func buildTXTAnswerChunk(data []byte, baseEncode bool) []byte {
 	return appendLengthPrefixedBase64TXT(data)
 }
 
-func appendRawTXTAnswerChunks(chunks [][]byte, payload []byte, cursor int, maxChunkNData int) [][]byte {
+func appendRawTXTAnswerChunks(chunks [][]byte, payload []byte, cursor, maxChunkNData int) [][]byte {
 	for chunkID := 1; cursor < len(payload); chunkID++ {
 		end := min(cursor+maxChunkNData, len(payload))
 		chunks = append(chunks, buildLengthPrefixedTXTChunk(byte(chunkID), payload[cursor:end]))
@@ -542,7 +541,7 @@ func appendRawTXTAnswerChunks(chunks [][]byte, payload []byte, cursor int, maxCh
 	return chunks
 }
 
-func appendBase64TXTAnswerChunks(chunks [][]byte, payload []byte, cursor int, maxChunkNData int) [][]byte {
+func appendBase64TXTAnswerChunks(chunks [][]byte, payload []byte, cursor, maxChunkNData int) [][]byte {
 	rawChunk := make([]byte, 1+maxChunkNData)
 	for chunkID := 1; cursor < len(payload); chunkID++ {
 		end := min(cursor+maxChunkNData, len(payload))
@@ -773,7 +772,7 @@ func encodeDNSNameStrict(name string) ([]byte, error) {
 	return encoded[:writeOffset], nil
 }
 
-func encodedQNameLen(encodedChars int, domainLen int) int {
+func encodedQNameLen(encodedChars, domainLen int) int {
 	if encodedChars <= 0 {
 		return domainLen
 	}
@@ -781,8 +780,10 @@ func encodedQNameLen(encodedChars int, domainLen int) int {
 	return encodedChars + labelSplits + 1 + domainLen
 }
 
-var dnsIDCounter atomic.Uint32
-var dnsIDInit sync.Once
+var (
+	dnsIDCounter atomic.Uint32
+	dnsIDInit    sync.Once
+)
 
 func nextDNSRequestID() uint16 {
 	dnsIDInit.Do(func() {

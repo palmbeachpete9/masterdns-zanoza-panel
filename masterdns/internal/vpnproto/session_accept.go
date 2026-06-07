@@ -204,7 +204,7 @@ func DecodeSessionScaledByte(value uint8) float64 {
 	return SessionPolicyScaledMin + normalized*(SessionPolicyScaledMax-SessionPolicyScaledMin)
 }
 
-func clampFloat64(value float64, minValue float64, maxValue float64) float64 {
+func clampFloat64(value, minValue, maxValue float64) float64 {
 	if value < minValue {
 		return minValue
 	}
@@ -216,7 +216,7 @@ func clampFloat64(value float64, minValue float64, maxValue float64) float64 {
 	return value
 }
 
-func clampInt(value int, minValue int, maxValue int) int {
+func clampInt(value, minValue, maxValue int) int {
 	if value < minValue {
 		return minValue
 	}
@@ -228,7 +228,7 @@ func clampInt(value int, minValue int, maxValue int) int {
 	return value
 }
 
-func maxInt(a int, b int) int {
+func maxInt(a, b int) int {
 	if a > b {
 		return a
 	}

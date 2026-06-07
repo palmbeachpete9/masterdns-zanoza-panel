@@ -36,7 +36,7 @@ func (s *Server) deferredConnectAttemptTimeout() time.Duration {
 	return timeout
 }
 
-func (s *Server) processDeferredDNSQuery(ctx context.Context, sessionID uint8, sessionCookie uint8, sequenceNum uint16, downloadCompression uint8, downloadMTUBytes int, assembledQuery []byte) {
+func (s *Server) processDeferredDNSQuery(ctx context.Context, sessionID, sessionCookie uint8, sequenceNum uint16, downloadCompression uint8, downloadMTUBytes int, assembledQuery []byte) {
 	if ctx != nil && ctx.Err() != nil {
 		return
 	}
@@ -78,7 +78,7 @@ func (s *Server) processDeferredDNSQuery(ctx context.Context, sessionID uint8, s
 	}
 }
 
-func (s *Server) finalizeDeferredConnectStream(sessionID uint8, streamID uint16, kind string, outcome string) {
+func (s *Server) finalizeDeferredConnectStream(sessionID uint8, streamID uint16, kind, outcome string) {
 	if s == nil || sessionID == 0 || streamID == 0 {
 		return
 	}
@@ -154,7 +154,6 @@ func (s *Server) processDeferredStreamSyn(ctx context.Context, vpnPacket VpnProt
 	defer cancelAttempt()
 
 	upstreamConn, err := s.dialTCPTargetContext(attemptCtx, net.JoinHostPort(s.cfg.ForwardIP, strconv.Itoa(s.cfg.ForwardPort)))
-
 	if err != nil {
 		timedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancelled := ctx != nil && ctx.Err() != nil && !timedOut
@@ -349,7 +348,6 @@ func (s *Server) processDeferredSOCKS5Syn(ctx context.Context, vpnPacket VpnProt
 	defer cancelAttempt()
 
 	upstreamConn, err := s.dialSOCKSStreamTargetContext(attemptCtx, target.Host, target.Port, assembledTarget)
-
 	if err != nil {
 		timedOut := errors.Is(attemptCtx.Err(), context.DeadlineExceeded)
 		cancelled := ctx != nil && ctx.Err() != nil && !timedOut

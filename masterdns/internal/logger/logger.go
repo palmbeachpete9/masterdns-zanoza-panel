@@ -80,7 +80,7 @@ func NewWithFile(name, rawLevel, filePath string) *Logger {
 	var fileWriter *os.File
 
 	if filePath != "" {
-		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 		if err == nil {
 			fileWriter = f
 		}
@@ -279,7 +279,7 @@ func renderColorTags(text string) string {
 	return b.String()
 }
 
-func parseColorTag(tag string) (name string, closing bool, ok bool) {
+func parseColorTag(tag string) (name string, closing, ok bool) {
 	if len(tag) < 3 || tag[0] != '<' || tag[len(tag)-1] != '>' {
 		return "", false, false
 	}

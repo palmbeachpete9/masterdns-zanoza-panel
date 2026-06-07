@@ -210,7 +210,7 @@ func normalizeParsedDomain(domain string) string {
 	return domain
 }
 
-func findAllowedDomain(requestName string, root *domainNode) (baseDomain string, labels string, matched bool) {
+func findAllowedDomain(requestName string, root *domainNode) (baseDomain, labels string, matched bool) {
 	if root == nil || requestName == "" {
 		return "", "", false
 	}
@@ -222,7 +222,17 @@ func findAllowedDomain(requestName string, root *domainNode) (baseDomain string,
 	for offset > 0 {
 		start := strings.LastIndexByte(requestName[:offset], '.')
 		labelStart := start + 1
-		child := node.children[requestName[labelStart:offset]]
+		label := requestName[labelStart:offset]
+		// DNS names are case-insensitive. The trie is built from lowercased
+		// domains, so look up the label case-insensitively. The original-case
+		// requestName is preserved for tunnel-label decoding and the response
+		// QNAME echo (which 0x20 case-randomizing resolvers require) (F23).
+		child := node.children[label]
+		if child == nil {
+			if lowered := asciiLower(label); lowered != label {
+				child = node.children[lowered]
+			}
+		}
 		if child == nil {
 			break
 		}
@@ -249,6 +259,28 @@ func findAllowedDomain(requestName string, root *domainNode) (baseDomain string,
 		labels = stripLabelDots(labels)
 	}
 	return baseDomain, labels, true
+}
+
+// asciiLower lowercases ASCII A-Z, allocating only when an uppercase byte is
+// present (the common all-lowercase tunnel label path stays allocation-free).
+func asciiLower(s string) string {
+	hasUpper := false
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= 'A' && c <= 'Z' {
+			hasUpper = true
+			break
+		}
+	}
+	if !hasUpper {
+		return s
+	}
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 func stripLabelDots(labels string) string {

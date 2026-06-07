@@ -25,7 +25,7 @@ func EncodedRawBase64Len(n int) int {
 	return rawBase64Encoding.EncodedLen(n)
 }
 
-func EncodeRawBase64To(dst []byte, data []byte) []byte {
+func EncodeRawBase64To(dst, data []byte) []byte {
 	if len(data) == 0 {
 		return dst
 	}
@@ -36,7 +36,7 @@ func EncodeRawBase64To(dst []byte, data []byte) []byte {
 	return dst
 }
 
-func EncodeRawBase64Into(dst []byte, data []byte) {
+func EncodeRawBase64Into(dst, data []byte) {
 	if len(data) == 0 {
 		return
 	}

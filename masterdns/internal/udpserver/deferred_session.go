@@ -46,7 +46,7 @@ type deferredSessionProcessor struct {
 	nextWorker         int
 }
 
-func deriveDeferredSessionPendingCap(workerCount int, queueLimit int) int32 {
+func deriveDeferredSessionPendingCap(workerCount, queueLimit int) int32 {
 	if workerCount <= 0 {
 		workerCount = 1
 	}
@@ -77,7 +77,7 @@ func deriveDeferredSessionPendingCap(workerCount int, queueLimit int) int32 {
 	return int32(capGuess)
 }
 
-func newDeferredSessionProcessor(workerCount int, queueLimit int, log *logger.Logger) *deferredSessionProcessor {
+func newDeferredSessionProcessor(workerCount, queueLimit int, log *logger.Logger) *deferredSessionProcessor {
 	if workerCount <= 0 {
 		return nil
 	}

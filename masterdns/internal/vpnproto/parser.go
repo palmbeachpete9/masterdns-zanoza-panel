@@ -213,7 +213,7 @@ func buildPacketFlags() [256]uint8 {
 	setValid := func(packetType uint8) {
 		flags[packetType] |= packetFlagValid
 	}
-	set := func(packetType uint8, extra uint8) {
+	set := func(packetType, extra uint8) {
 		flags[packetType] |= packetFlagValid | extra
 	}
 

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,12 +24,16 @@ import (
 )
 
 type testNetConn struct {
-	closed bool
+	// closed is atomic: the dial cancel-watch goroutine may Close() it
+	// concurrently with the test reading it (race-free harness, F16).
+	closed atomic.Bool
 }
+
+func (t *testNetConn) isClosed() bool { return t.closed.Load() }
 
 func (t *testNetConn) Read(_ []byte) (int, error)         { return 0, io.EOF }
 func (t *testNetConn) Write(p []byte) (int, error)        { return len(p), nil }
-func (t *testNetConn) Close() error                       { t.closed = true; return nil }
+func (t *testNetConn) Close() error                       { t.closed.Store(true); return nil }
 func (t *testNetConn) LocalAddr() net.Addr                { return testAddr("local") }
 func (t *testNetConn) RemoteAddr() net.Addr               { return testAddr("remote") }
 func (t *testNetConn) SetDeadline(_ time.Time) error      { return nil }
@@ -129,7 +134,7 @@ func TestProcessDeferredStreamSynQueuesConnectedAndEnablesIO(t *testing.T) {
 	local, remote := net.Pipe()
 	defer remote.Close()
 
-	s.dialStreamUpstreamFn = func(network string, address string, timeoutSeconds time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeoutSeconds time.Duration) (net.Conn, error) {
 		return local, nil
 	}
 
@@ -168,7 +173,7 @@ func TestProcessDeferredStreamSynDoesNotAttachAfterCancellation(t *testing.T) {
 	dialStarted := make(chan struct{})
 	releaseDial := make(chan struct{})
 	conn := &testNetConn{}
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		close(dialStarted)
 		<-releaseDial
 		return conn, nil
@@ -214,7 +219,7 @@ func TestProcessDeferredStreamSynDoesNotAttachAfterCancellation(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if conn.closed {
+		if conn.isClosed() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -307,7 +312,7 @@ func TestProcessDeferredSOCKS5SynDoesNotAttachAfterCancellation(t *testing.T) {
 	dialStarted := make(chan struct{})
 	releaseDial := make(chan struct{})
 	conn := &testNetConn{}
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		close(dialStarted)
 		<-releaseDial
 		return conn, nil
@@ -355,7 +360,7 @@ func TestProcessDeferredSOCKS5SynDoesNotAttachAfterCancellation(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if conn.closed {
+		if conn.isClosed() {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -717,7 +722,7 @@ func TestProcessDeferredSOCKS5SynSkipsDialForRecentlyClosedStream(t *testing.T) 
 	s.sessions.byID[record.ID] = record
 	record.noteStreamClosed(10, time.Now(), false)
 
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		t.Fatalf("unexpected dial for recently closed stream")
 		return nil, nil
 	}
@@ -734,7 +739,7 @@ func TestProcessDeferredSOCKS5SynClearsQueuedDuplicatesAfterConnectFailure(t *te
 	record := newTestSessionRecord(42)
 	record.DownloadCompression = 0
 	s.sessions.byID[record.ID] = record
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
 	}
 
@@ -762,7 +767,7 @@ func TestProcessDeferredStreamSynQueuesConnectFailOnDialError(t *testing.T) {
 	record := newTestSessionRecord(23)
 	record.DownloadCompression = 0
 	s.sessions.byID[record.ID] = record
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
 	}
 
@@ -792,7 +797,7 @@ func TestProcessDeferredStreamSynIgnoresLateDialCompletionAfterSessionClose(t *t
 	s.sessions.byID[record.ID] = record
 
 	conn := &testNetConn{}
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		record.markClosed()
 		return conn, nil
 	}
@@ -818,7 +823,7 @@ func TestProcessDeferredStreamSynIgnoresLateDialCompletionAfterSessionClose(t *t
 	if upstream != nil {
 		t.Fatal("expected no upstream connection to be attached after session close")
 	}
-	if !conn.closed {
+	if !conn.isClosed() {
 		t.Fatal("expected late dialed connection to be closed")
 	}
 
@@ -834,7 +839,7 @@ func TestProcessDeferredStreamSynTimesOutBlockedDial(t *testing.T) {
 	record := newTestSessionRecord(26)
 	record.DownloadCompression = 0
 	s.sessions.byID[record.ID] = record
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		time.Sleep(500 * time.Millisecond)
 		return nil, nil
 	}
@@ -863,7 +868,7 @@ func TestProcessDeferredStreamSynClearsQueuedDuplicatesAfterDialFailure(t *testi
 	record := newTestSessionRecord(41)
 	record.DownloadCompression = 0
 	s.sessions.byID[record.ID] = record
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return nil, errors.New("dial failed")
 	}
 
@@ -896,7 +901,7 @@ func TestDialTCPTargetContextPassesEffectiveDeadlineToDialer(t *testing.T) {
 	s.socksConnectTimeout = 120 * time.Second
 
 	var received time.Duration
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		received = timeout
 		return nil, context.DeadlineExceeded
 	}
@@ -916,7 +921,7 @@ func TestProcessDeferredSOCKS5SynTimesOutBlockedDial(t *testing.T) {
 	record := newTestSessionRecord(27)
 	record.DownloadCompression = 0
 	s.sessions.byID[record.ID] = record
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		time.Sleep(500 * time.Millisecond)
 		return nil, nil
 	}
@@ -996,7 +1001,7 @@ func TestValidateSOCKSTargetHostAllowsPublicTargets(t *testing.T) {
 func TestDialSOCKSStreamTargetRejectsBlockedTargetBeforeDial(t *testing.T) {
 	s := newTestServerForStreamSyn("SOCKS5")
 	s.useExternalSOCKS5 = true
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		t.Fatalf("unexpected dial attempt to %s", address)
 		return nil, nil
 	}
@@ -1013,7 +1018,7 @@ func TestDialSOCKSStreamTargetBypassesExternalProxyForTCPModeConnects(t *testing
 
 	var gotNetwork string
 	var gotAddress string
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		gotNetwork = network
 		gotAddress = address
 		return &testNetConn{}, nil
@@ -1054,7 +1059,7 @@ func TestDialSOCKSStreamTargetUsesExternalProxyWhenEnabled(t *testing.T) {
 
 	var gotNetwork string
 	var gotAddress string
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		gotNetwork = network
 		gotAddress = address
 		return conn, nil
@@ -1104,7 +1109,7 @@ func TestDialSOCKSStreamTargetExternalProxyDetachesSuccessfulConnFromHandshakeCo
 		},
 	}
 
-	s.dialStreamUpstreamFn = func(network string, address string, timeout time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return conn, nil
 	}
 
@@ -1121,7 +1126,7 @@ func TestDialSOCKSStreamTargetExternalProxyDetachesSuccessfulConnFromHandshakeCo
 	cancel()
 	time.Sleep(20 * time.Millisecond)
 
-	if conn.closed {
+	if conn.isClosed() {
 		t.Fatal("expected successful external SOCKS5 connection to stay open after handshake context cancellation")
 	}
 }
@@ -1133,7 +1138,7 @@ func TestMapSOCKSConnectErrorMapsBlockedTargetToRulesetDenied(t *testing.T) {
 	}
 }
 
-func packetWithSession(packetType uint8, sessionID uint8, cookie uint8, streamID uint16) VpnProto.Packet {
+func packetWithSession(packetType, sessionID, cookie uint8, streamID uint16) VpnProto.Packet {
 	return VpnProto.Packet{
 		SessionID:      sessionID,
 		SessionCookie:  cookie,
@@ -1153,7 +1158,7 @@ func viewForRecord(record *sessionRecord) *sessionRuntimeView {
 	return &view
 }
 
-func equalBytes(a []byte, b []byte) bool {
+func equalBytes(a, b []byte) bool {
 	if len(a) != len(b) {
 		return false
 	}

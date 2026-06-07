@@ -20,7 +20,6 @@ import (
 	dnsCache "masterdnsvpn-go/internal/dnscache"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
-	"masterdnsvpn-go/internal/keyring"
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/security"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
@@ -40,26 +39,31 @@ const (
 var preSessionPacketTypes = buildPreSessionPacketTypes()
 
 type Server struct {
-	cfg                      config.ServerConfig
-	log                      *logger.Logger
-	codec                    *security.Codec
-	// zanoza-panel fork: keyResolver and matcher are swapped atomically on
-	// SIGHUP so the panel can add/remove domains+keys without restarting.
-	keyResolver              atomic.Pointer[keyring.Resolver]
-	matcher                  atomic.Pointer[domainMatcher.Matcher]
-	sessions                 *sessionStore
-	deferredDNSSession       *deferredSessionProcessor
-	deferredConnectSession   *deferredSessionProcessor
-	invalidCookieTracker     *invalidCookieTracker
-	dnsCache                 *dnsCache.Store
-	dnsResolveInflight       *dnsResolveInflightManager
-	dnsUpstreamServers       []string
-	dnsUpstreamBufferPool    sync.Pool
-	dnsFragments             *fragmentStore.Store[dnsFragmentKey]
-	socks5Fragments          *fragmentStore.Store[socks5FragmentKey]
-	dnsFragmentTimeout       time.Duration
-	resolveDNSQueryFn        func([]byte) ([]byte, error)
-	dialStreamUpstreamFn     func(string, string, time.Duration) (net.Conn, error)
+	cfg   config.ServerConfig
+	log   *logger.Logger
+	codec *security.Codec
+	// zanoza-panel fork: the domain matcher and per-domain key resolver are
+	// published together as one immutable ingressGeneration through a single
+	// atomic pointer, so a request can never match with generation N+1 and
+	// decrypt with generation N (or vice versa) across a SIGHUP reload (F25).
+	ingress                atomic.Pointer[ingressGeneration]
+	ingressID              atomic.Uint64
+	sessions               *sessionStore
+	deferredDNSSession     *deferredSessionProcessor
+	deferredConnectSession *deferredSessionProcessor
+	invalidCookieTracker   *invalidCookieTracker
+	dnsCache               *dnsCache.Store
+	dnsResolveInflight     *dnsResolveInflightManager
+	dnsUpstreamServers     []string
+	dnsUpstreamBufferPool  sync.Pool
+	dnsFragments           *fragmentStore.Store[dnsFragmentKey]
+	socks5Fragments        *fragmentStore.Store[socks5FragmentKey]
+	dnsFragmentTimeout     time.Duration
+	resolveDNSQueryFn      func([]byte) ([]byte, error)
+	dialStreamUpstreamFn   func(string, string, time.Duration) (net.Conn, error)
+	// resolveIPAddrFn resolves a hostname to IPs for SOCKS target authorization.
+	// Injectable for deterministic rebinding tests (F19); nil = DNS default.
+	resolveIPAddrFn          func(context.Context, string) ([]net.IPAddr, error)
 	uploadCompressionMask    uint8
 	downloadCompressionMask  uint8
 	dropLogIntervalNanos     int64
@@ -146,7 +150,7 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 				return make([]byte, 65535)
 			},
 		},
-		dialStreamUpstreamFn: func(network string, address string, timeout time.Duration) (net.Conn, error) {
+		dialStreamUpstreamFn: func(network, address string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout(network, address, timeout)
 		},
 		uploadCompressionMask:    buildCompressionMask(cfg.SupportedUploadCompressionTypes),
@@ -174,7 +178,10 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 			},
 		},
 	}
-	srv.matcher.Store(domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength))
+	srv.ingress.Store(&ingressGeneration{
+		matcher: domainMatcher.New(cfg.Domain, cfg.MinVPNLabelLength),
+		id:      srv.ingressID.Add(1),
+	})
 	return srv
 }
 
@@ -278,7 +285,7 @@ func (s *throttledLogState) pruneLocked(nowUnixNano int64, interval time.Duratio
 	}
 }
 
-func splitDeferredSessionPools(totalWorkers int, totalQueue int) (dnsWorkers int, connectWorkers int, dnsQueue int, connectQueue int) {
+func splitDeferredSessionPools(totalWorkers, totalQueue int) (dnsWorkers, connectWorkers, dnsQueue, connectQueue int) {
 	if totalWorkers <= 0 {
 		totalWorkers = 1
 	}

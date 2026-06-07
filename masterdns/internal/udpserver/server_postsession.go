@@ -298,7 +298,7 @@ func (s *Server) handlePackedControlBlocksRequest(vpnPacket VpnProto.Packet, ses
 
 	handled := false
 	sawBlock := false
-	VpnProto.ForEachPackedControlBlock(vpnPacket.Payload, func(packetType uint8, streamID uint16, sequenceNum uint16, fragmentID uint8, totalFragments uint8) bool {
+	VpnProto.ForEachPackedControlBlock(vpnPacket.Payload, func(packetType uint8, streamID, sequenceNum uint16, fragmentID, totalFragments uint8) bool {
 		if packetType == Enums.PACKET_PACKED_CONTROL_BLOCKS {
 			return true
 		}

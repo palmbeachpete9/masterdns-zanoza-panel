@@ -8,9 +8,10 @@
 package vpnproto
 
 import (
-	Enums "masterdnsvpn-go/internal/enums"
 	"strconv"
 	"strings"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 // PackedControlBlockSize is the fixed size of each block inside a PACKET_PACKED_CONTROL_BLOCKS (Type 14)
@@ -67,8 +68,9 @@ func IsPackableControlPacket(packetType uint8, payloadLen int) bool {
 }
 
 // AppendPackedControlBlock serializes a control packet metadata into a 7-byte block and appends it to dst.
-func AppendPackedControlBlock(dst []byte, ptype uint8, streamID uint16, sn uint16, fragID uint8, total uint8) []byte {
-	return append(dst,
+func AppendPackedControlBlock(dst []byte, ptype uint8, streamID, sn uint16, fragID, total uint8) []byte {
+	return append(
+		dst,
 		ptype,
 		uint8(streamID>>8), uint8(streamID),
 		uint8(sn>>8), uint8(sn),
@@ -78,7 +80,7 @@ func AppendPackedControlBlock(dst []byte, ptype uint8, streamID uint16, sn uint1
 }
 
 // ForEachPackedControlBlock iterates over a Type 14 payload and invokes yield for each block.
-func ForEachPackedControlBlock(payload []byte, yield func(ptype uint8, streamID uint16, sn uint16, fragID uint8, total uint8) bool) {
+func ForEachPackedControlBlock(payload []byte, yield func(ptype uint8, streamID, sn uint16, fragID, total uint8) bool) {
 	if payload == nil || yield == nil {
 		return
 	}
@@ -110,7 +112,7 @@ func DescribePackedControlBlocks(payload []byte, maxKinds int) string {
 	counts := make(map[uint8]int)
 	totalBlocks := 0
 
-	ForEachPackedControlBlock(payload, func(ptype uint8, _ uint16, _ uint16, _ uint8, _ uint8) bool {
+	ForEachPackedControlBlock(payload, func(ptype uint8, _, _ uint16, _, _ uint8) bool {
 		totalBlocks++
 		if _, exists := counts[ptype]; !exists {
 			order = append(order, ptype)

@@ -70,7 +70,7 @@ type Store struct {
 	dirty          atomic.Uint64 // used as a flag/counter
 }
 
-func New(maxRecords int, cacheTTL time.Duration, pendingTimeout time.Duration) *Store {
+func New(maxRecords int, cacheTTL, pendingTimeout time.Duration) *Store {
 	if maxRecords < 1 {
 		maxRecords = 1
 	}
@@ -92,7 +92,7 @@ func New(maxRecords int, cacheTTL time.Duration, pendingTimeout time.Duration) *
 	return s
 }
 
-func BuildKey(domain string, qType uint16, qClass uint16) string {
+func BuildKey(domain string, qType, qClass uint16) string {
 	key := make([]byte, 4+len(domain))
 	binary.BigEndian.PutUint16(key[0:2], qType)
 	binary.BigEndian.PutUint16(key[2:4], qClass)
@@ -106,7 +106,7 @@ func getShardIndex(key string) int {
 	return int(h.Sum32() & shardMask)
 }
 
-func PatchResponseForQuery(rawResponse []byte, rawQuery []byte) []byte {
+func PatchResponseForQuery(rawResponse, rawQuery []byte) []byte {
 	if len(rawResponse) < 2 {
 		return rawResponse
 	}
@@ -126,7 +126,7 @@ func PatchResponseForQuery(rawResponse []byte, rawQuery []byte) []byte {
 	return patched
 }
 
-func (s *Store) LookupOrCreatePending(key string, domain string, qType uint16, qClass uint16, now time.Time) LookupResult {
+func (s *Store) LookupOrCreatePending(key, domain string, qType, qClass uint16, now time.Time) LookupResult {
 	if s == nil || key == "" {
 		return LookupResult{}
 	}
@@ -216,7 +216,7 @@ func (s *Store) GetReady(key string, rawQuery []byte, now time.Time) ([]byte, bo
 	return PatchResponseForQuery(node.entry.Response, rawQuery), true
 }
 
-func (s *Store) SetReady(key string, domain string, qType uint16, qClass uint16, rawResponse []byte, now time.Time) {
+func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse []byte, now time.Time) {
 	if s == nil || key == "" || len(rawResponse) < 2 {
 		return
 	}

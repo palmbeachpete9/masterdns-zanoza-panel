@@ -72,8 +72,7 @@ func DefaultPacketPriority(packetType uint8) int {
 		PACKET_SESSION_CLOSE:
 		return PacketPriorityLow
 
-	case PACKET_PING,
-		PACKET_PONG:
+	case PACKET_PING, PACKET_PONG:
 		return PacketPriorityIdle
 
 	default:

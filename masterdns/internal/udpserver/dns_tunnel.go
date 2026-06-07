@@ -87,6 +87,17 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 		return response
 	}
 
+	// The cache/in-flight key covers only the first question, so a multi-question
+	// query could be answered from another query that shares only its first
+	// question. Reject anything but exactly one question (F22).
+	if parsed.Header.QDCount != 1 {
+		response, responseErr := DnsParser.BuildFormatErrorResponseFromLite(rawQuery, parsed)
+		if responseErr != nil {
+			return nil
+		}
+		return response
+	}
+
 	if !DnsParser.IsSupportedTunnelDNSQuery(parsed.FirstQuestion.Type, parsed.FirstQuestion.Class) {
 		response, responseErr := DnsParser.BuildNotImplementedResponseFromLite(rawQuery, parsed)
 		if responseErr != nil {
@@ -187,7 +198,7 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 	return resolved
 }
 
-func (s *Server) collectDNSQueryFragments(sessionID uint8, sequenceNum uint16, payload []byte, fragmentID uint8, totalFragments uint8, now time.Time) ([]byte, bool, bool) {
+func (s *Server) collectDNSQueryFragments(sessionID uint8, sequenceNum uint16, payload []byte, fragmentID, totalFragments uint8, now time.Time) ([]byte, bool, bool) {
 	if totalFragments == 0 {
 		totalFragments = 1
 	}

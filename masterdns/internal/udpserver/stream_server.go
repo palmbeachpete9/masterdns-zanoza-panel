@@ -42,7 +42,7 @@ type Stream_server struct {
 	log          arq.Logger
 }
 
-func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, localConn io.ReadWriteCloser, mtu int, queueInitialCapacity int, logger arq.Logger) *Stream_server {
+func NewStreamServer(streamID uint16, sessionID uint8, arqConfig arq.Config, localConn io.ReadWriteCloser, mtu, queueInitialCapacity int, logger arq.Logger) *Stream_server {
 	if queueInitialCapacity < 1 {
 		queueInitialCapacity = 32
 	}
@@ -76,7 +76,7 @@ func (s *Stream_server) enqueueInboundData(packetType uint8, sequenceNum uint16,
 
 // PushTXPacket implements arq.PacketEnqueuer.
 // It adds a packet to the stream's multi-level queue.
-func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID uint8, totalFragments uint8, compressionType uint8, ttl time.Duration, payload []byte) bool {
+func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum uint16, fragmentID, totalFragments, compressionType uint8, ttl time.Duration, payload []byte) bool {
 	s.mu.Lock()
 	s.LastActivity = time.Now()
 	s.mu.Unlock()
@@ -198,7 +198,6 @@ func (s *Stream_server) ClearTXQueue() {
 	})
 
 	s.txQueueMu.Unlock()
-
 }
 
 func (s *Stream_server) FastTXQueueSize() int {

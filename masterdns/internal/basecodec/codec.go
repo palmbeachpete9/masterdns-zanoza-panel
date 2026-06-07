@@ -11,7 +11,7 @@ func EncodedLen(n int) int {
 	return EncodedLenLowerBase36(n)
 }
 
-func EncodeTo(dst []byte, data []byte) int {
+func EncodeTo(dst, data []byte) int {
 	return EncodeLowerBase36To(dst, data)
 }
 

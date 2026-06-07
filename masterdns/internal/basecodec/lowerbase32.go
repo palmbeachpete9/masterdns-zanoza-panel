@@ -21,7 +21,7 @@ func EncodedLenLowerBase32(n int) int {
 	return lowerBase32Encoding.EncodedLen(n)
 }
 
-func EncodeLowerBase32To(dst []byte, data []byte) int {
+func EncodeLowerBase32To(dst, data []byte) int {
 	if len(data) == 0 {
 		return 0
 	}

@@ -19,6 +19,15 @@ import (
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
+// ingressGeneration is the immutable matcher+resolver pair published atomically
+// on reload. A single request loads it once and uses it for both domain
+// matching and decryption, so the two phases never straddle a reload (F25).
+type ingressGeneration struct {
+	matcher  *domainMatcher.Matcher
+	resolver *keyring.Resolver // nil = legacy single-codec mode
+	id       uint64
+}
+
 func (s *Server) handlePacket(packet []byte) []byte {
 	parsed, err := DnsParser.ParseDNSRequestLite(packet)
 	if err != nil {
@@ -33,9 +42,14 @@ func (s *Server) handlePacket(packet []byte) []byte {
 		return s.buildNoDataResponseLogged(packet, "request-has-no-question")
 	}
 
-	decision := s.matcher.Load().Match(parsed)
+	gen := s.ingress.Load()
+	if gen == nil || gen.matcher == nil {
+		return s.buildNoDataResponseLogged(packet, "ingress-not-ready")
+	}
+
+	decision := gen.matcher.Match(parsed)
 	if decision.Action == domainMatcher.ActionProcess {
-		response := s.handleTunnelCandidate(packet, parsed, decision)
+		response := s.handleTunnelCandidate(packet, parsed, decision, gen)
 		if response != nil {
 			return response
 		}
@@ -54,33 +68,49 @@ func (s *Server) handlePacket(packet []byte) []byte {
 // set, inbound tunnel labels are decrypted with the key(s) bound to the
 // queried domain instead of the single global codec.
 func (s *Server) SetKeyResolver(resolver *keyring.Resolver) {
-	s.keyResolver.Store(resolver)
+	// Publish a new generation that swaps the resolver while preserving the
+	// current matcher (initial wiring), under a CAS retry loop.
+	for {
+		cur := s.ingress.Load()
+		var m *domainMatcher.Matcher
+		if cur != nil {
+			m = cur.matcher
+		}
+		next := &ingressGeneration{matcher: m, resolver: resolver, id: s.ingressID.Add(1)}
+		if s.ingress.CompareAndSwap(cur, next) {
+			return
+		}
+	}
 }
 
-// ReloadKeyring atomically swaps the per-domain keyring and the domain
-// matcher from keyring.json. Called on SIGHUP so the panel can add/remove
-// domains+keys without restarting the server (no dropped sessions).
+// ReloadKeyring builds an entire new ingress generation (matcher + resolver)
+// from keyring.json and publishes it atomically as one unit. Called on SIGHUP
+// so the panel can add/remove domains+keys without restarting (F25).
 func (s *Server) ReloadKeyring(path string) error {
 	resolver, err := keyring.Load(path)
 	if err != nil {
 		return err
 	}
-	s.matcher.Store(domainMatcher.New(resolver.Domains(), s.cfg.MinVPNLabelLength))
-	s.keyResolver.Store(resolver)
+	next := &ingressGeneration{
+		matcher:  domainMatcher.New(resolver.Domains(), s.cfg.MinVPNLabelLength),
+		resolver: resolver,
+		id:       s.ingressID.Add(1),
+	}
+	s.ingress.Store(next)
 	return nil
 }
 
-// parseInboundLabels decrypts+parses tunnel labels using the per-domain
-// keyring when configured, falling back to the legacy single codec.
-func (s *Server) parseInboundLabels(baseDomain, labels string) (VpnProto.Packet, error) {
-	if r := s.keyResolver.Load(); r != nil && !r.Empty() {
-		return r.Parse(baseDomain, labels)
+// parseInboundLabels decrypts+parses tunnel labels using the resolver from the
+// supplied generation, falling back to the legacy single codec.
+func (s *Server) parseInboundLabels(gen *ingressGeneration, baseDomain, labels string) (VpnProto.Packet, error) {
+	if gen != nil && gen.resolver != nil && !gen.resolver.Empty() {
+		return gen.resolver.Parse(baseDomain, labels)
 	}
 	return VpnProto.ParseInflatedFromLabels(labels, s.codec)
 }
 
-func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision) []byte {
-	vpnPacket, err := s.parseInboundLabels(decision.BaseDomain, decision.Labels)
+func (s *Server) handleTunnelCandidate(packet []byte, parsed DnsParser.LitePacket, decision domainMatcher.Decision, gen *ingressGeneration) []byte {
+	vpnPacket, err := s.parseInboundLabels(gen, decision.BaseDomain, decision.Labels)
 	if err != nil {
 		return s.buildNoDataResponseLiteLogged(packet, parsed, "vpn-proto-parse-failed")
 	}

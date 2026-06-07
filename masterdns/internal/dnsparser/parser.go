@@ -176,7 +176,7 @@ func parseHeader(data []byte) Header {
 	}
 }
 
-func parseQuestions(data []byte, offset int, count int) ([]Question, int, error) {
+func parseQuestions(data []byte, offset, count int) ([]Question, int, error) {
 	if count == 0 {
 		return nil, offset, nil
 	}
@@ -204,7 +204,7 @@ func parseQuestions(data []byte, offset int, count int) ([]Question, int, error)
 	return questions, offset, nil
 }
 
-func parseResourceRecords(data []byte, offset int, count int) ([]ResourceRecord, int, error) {
+func parseResourceRecords(data []byte, offset, count int) ([]ResourceRecord, int, error) {
 	if count == 0 {
 		return nil, offset, nil
 	}

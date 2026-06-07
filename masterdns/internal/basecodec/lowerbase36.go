@@ -37,7 +37,7 @@ func EncodedLenLowerBase36(n int) int {
 	return blocks*11 + lowerBase36EncodedCharsByBytes[rem]
 }
 
-func EncodeLowerBase36To(dst []byte, data []byte) int {
+func EncodeLowerBase36To(dst, data []byte) int {
 	if len(data) == 0 {
 		return 0
 	}
@@ -211,7 +211,7 @@ func decodedLenLowerBase36(encodedLen int) (int, error) {
 	return blocks*7 + decodedRem, nil
 }
 
-func lowerBase36NextDecodeBlock(remaining int) (blockSize int, charCount int) {
+func lowerBase36NextDecodeBlock(remaining int) (blockSize, charCount int) {
 	if remaining >= 11 {
 		return 7, 11
 	}
