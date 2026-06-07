@@ -83,13 +83,11 @@ func TestMaybeAutoSetup(t *testing.T) {
 		t.Fatal("fresh creds should require setup")
 	}
 
-	// Without env vars — should be a no-op.
 	maybeAutoSetup(creds)
 	if !creds.setupRequired() {
 		t.Fatal("setup should still be required without env vars")
 	}
 
-	// With env vars.
 	t.Setenv(EnvUser, "admin")
 	t.Setenv(EnvPassword, "secret123")
 

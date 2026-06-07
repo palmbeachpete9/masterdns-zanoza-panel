@@ -14,7 +14,7 @@ const (
 	EnvUser     = "ZANOZA_USER"
 	EnvPassword = "ZANOZA_PASSWORD"
 
-	EnvMasterdnsBin = "ZANOZA_BIN"
+	EnvMasterdnsBin = "ZANOZA_MASTERDNS_BIN"
 
 	EnvDNSHost     = "ZANOZA_DNS_HOST"
 	EnvDNSPort     = "ZANOZA_DNS_PORT"
