@@ -14,9 +14,32 @@ RestartSec=5s
 KillSignal=SIGTERM
 TimeoutStopSec=15s
 
-# The panel supervises the MasterDnsVPN server which binds UDP :53,
-# so it needs the privilege to bind low ports (run as root, or grant
-# CAP_NET_BIND_SERVICE to the masterdns-server binary).
+# ---------------------------------------------------------------------------
+# Hardening (F26). The panel supervises the MasterDnsVPN child which binds
+# UDP :53, so the unit retains only CAP_NET_BIND_SERVICE (low-port bind) and
+# drops every other capability — even though it runs as root for the bind.
+# The longer-term hardening is a full service split (dedicated unprivileged
+# panel user + dedicated masterdns user with a socket unit for :53).
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ProtectSystem=strict
+ReadWritePaths=/etc/zanoza-panel
+ProtectHome=true
+PrivateTmp=true
+ProtectControlGroups=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=multi-user.target

@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.4"
+
+jobs:
+  go-panel:
+    name: Panel (root module)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go vet ./cmd/...
+      - run: go test -shuffle=on -count=2 ./cmd/...
+      - run: go test -race -shuffle=on -count=1 ./cmd/...
+
+  go-masterdns:
+    name: MasterDNS (nested module)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: masterdns
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: masterdns/go.sum
+      - run: go vet ./...
+      - run: go test -shuffle=on -count=2 ./...
+      - run: go test -race -shuffle=on -count=1 ./...
+
+  lint:
+    name: golangci-lint + gofumpt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint run ./...
+      - name: gofumpt formatting
+        run: |
+          out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools)"
+          if [ -n "$out" ]; then echo "Unformatted files:"; echo "$out"; exit 1; fi
+
+  frontend:
+    name: Frontend build + typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+      - run: npm audit --omit=dev || true
+
+  shell:
+    name: Shell syntax + ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash -n scripts/install.sh scripts/zanoza
+      - uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          scandir: scripts

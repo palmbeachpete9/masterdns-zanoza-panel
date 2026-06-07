@@ -100,9 +100,11 @@ cert_menu(){
 	need_root
 	if [ -x /usr/local/bin/zanoza-renew-cert ]; then
 		/usr/local/bin/zanoza-renew-cert && c_g "Self-signed сертификат перевыпущен."
+	elif [ -f "$SRC_DIR/scripts/install.sh" ]; then
+		c_y "Запуск локального установщика для настройки сертификата..."
+		bash "$SRC_DIR/scripts/install.sh" || true
 	else
-		c_y "Перезапуск установщика для настройки сертификата..."
-		curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | bash || true
+		c_r "исходники не найдены в $SRC_DIR — переустановите панель для смены сертификата."
 	fi
 }
 uninstall(){
@@ -120,7 +122,11 @@ uninstall(){
 }
 update(){
 	need_root
-	curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | bash
+	# Run the on-disk installer in non-interactive update mode (preserves config,
+	# credentials, port/path/TLS, instances; atomic binary swap with rollback).
+	# Never pipe remote code straight into a root shell (F10/F27).
+	[ -f "$SRC_DIR/scripts/install.sh" ] || { c_r "исходники не найдены в $SRC_DIR — переустановите панель."; return 1; }
+	ZANOZA_MODE=update bash "$SRC_DIR/scripts/install.sh"
 }
 
 menu(){
