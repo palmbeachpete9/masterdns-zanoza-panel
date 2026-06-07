@@ -80,6 +80,25 @@ masterdns-zanoza-panel/
 └── packaging/systemd/zanoza-panel.service
 ```
 
+## Environment Variables
+
+All variables are optional; the panel works without them using defaults.
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `ZANOZA_CONFIG` | Path to the panel JSON config | `/etc/zanoza-panel/config.json` |
+| `ZANOZA_RUNTIME_DIR` | Directory for keyring.json + server_config.toml | `<configDir>/masterdns` |
+| `ZANOZA_PANEL_ADDR` | HTTP listen address | from `config.json` |
+| `ZANOZA_PANEL_PORT` | Panel port (1–65535) | from `config.json` |
+| `ZANOZA_PANEL_PATH` | Admin URL path (e.g. `/secret`) | from `config.json` |
+| `ZANOZA_TLS_CERT` / `ZANOZA_TLS_KEY` | TLS certificate and key paths | from `config.json` |
+| `ZANOZA_NAME` | Server name (shown in UI) | from `config.json` |
+| `ZANOZA_USER` / `ZANOZA_PASSWORD` | Auto-create admin on first run | — (first setup only) |
+| `MASTERDNS_BIN` | Path to the MasterDnsVPN binary | `/usr/local/bin/masterdns-server` |
+| `ZANOZA_DNS_HOST` | DNS server UDP listen address | `0.0.0.0` |
+| `ZANOZA_DNS_PORT` | DNS server UDP port (1–65535) | `53` |
+| `ZANOZA_DNS_UPSTREAM` | JSON array of upstream resolvers | `["1.1.1.1:53", "1.0.0.1:53"]` |
+
 ## Build from source
 
 ```sh

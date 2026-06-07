@@ -81,6 +81,25 @@ masterdns-zanoza-panel/
 └── packaging/systemd/zanoza-panel.service
 ```
 
+## Переменные окружения
+
+Все переменные опциональны; панель работает без них с дефолтными значениями.
+
+| Переменная | Назначение | По умолчанию |
+|---|---|---|
+| `ZANOZA_CONFIG` | Путь к JSON-конфигу панели | `/etc/zanoza-panel/config.json` |
+| `ZANOZA_RUNTIME_DIR` | Директория для keyring.json и server_config.toml | `<configDir>/masterdns` |
+| `ZANOZA_PANEL_ADDR` | IP-адрес для HTTP-сервера | из `config.json` |
+| `ZANOZA_PANEL_PORT` | Порт панели (1–65535) | из `config.json` |
+| `ZANOZA_PANEL_PATH` | URL-путь админки (например `/secret`) | из `config.json` |
+| `ZANOZA_TLS_CERT` / `ZANOZA_TLS_KEY` | Пути к TLS-сертификату и ключу | из `config.json` |
+| `ZANOZA_NAME` | Имя сервера (отображается в UI) | из `config.json` |
+| `ZANOZA_USER` / `ZANOZA_PASSWORD` | Авто-создание админа при первом запуске | — (только при первой настройке) |
+| `MASTERDNS_BIN` | Путь к бинарнику MasterDnsVPN | `/usr/local/bin/masterdns-server` |
+| `ZANOZA_DNS_HOST` | UDP-адрес DNS-сервера | `0.0.0.0` |
+| `ZANOZA_DNS_PORT` | UDP-порт DNS-сервера (1–65535) | `53` |
+| `ZANOZA_DNS_UPSTREAM` | JSON-массив upstream-резолверов | `["1.1.1.1:53", "1.0.0.1:53"]` |
+
 ## Сборка из исходников
 
 ```sh
