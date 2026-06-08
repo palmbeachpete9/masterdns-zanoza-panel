@@ -28,6 +28,10 @@ type Stream_server struct {
 	SessionID uint8
 	ARQ       *arq.ARQ
 	TXQueue   *mlq.MultiLevelQueue[*serverStreamTXPacket]
+	// txClosed is guarded by txQueueMu. Once ClearTXQueue marks the stream's TX
+	// closed, no further packet can be enqueued — so a late ARQ worker can't
+	// re-populate the queue after cleanup (F16).
+	txClosed bool
 
 	Status       string
 	CreatedAt    time.Time
@@ -98,6 +102,14 @@ func (s *Stream_server) PushTXPacket(priority int, packetType uint8, sequenceNum
 	pkt.TTL = ttl
 
 	s.txQueueMu.Lock()
+
+	// Reject enqueues once the TX queue is closed; serialized on txQueueMu with
+	// ClearTXQueue so no packet can land after cleanup (F16).
+	if s.txClosed {
+		s.txQueueMu.Unlock()
+		putTXPacketToPool(pkt)
+		return false
+	}
 
 	switch packetType {
 	case Enums.PACKET_STREAM_DATA:
@@ -193,6 +205,7 @@ func (s *Stream_server) ClearTXQueue() {
 	}
 
 	s.txQueueMu.Lock()
+	s.txClosed = true
 	s.TXQueue.Clear(func(pkt *serverStreamTXPacket) {
 		putTXPacketToPool(pkt)
 	})

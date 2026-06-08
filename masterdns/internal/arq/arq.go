@@ -488,6 +488,24 @@ func (a *ARQ) Done() <-chan struct{} {
 	return a.ctx.Done()
 }
 
+// WaitClosed blocks until every ARQ-owned worker goroutine has returned, or the
+// timeout elapses (returning false). It is a close barrier callers can use to
+// guarantee no worker can still run or enqueue after teardown. Must NOT be
+// called from within an ARQ worker (it would wait on itself) (F16).
+func (a *ARQ) WaitClosed(timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		a.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // ---------------------------------------------------------------------
 // Small Utilities
 // ---------------------------------------------------------------------
