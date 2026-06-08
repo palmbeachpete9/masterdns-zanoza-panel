@@ -999,10 +999,20 @@ func TestARQ_ReceiveDataClearsQueuedNackWhenMissingDataArrives(t *testing.T) {
 	a.ReceiveData(0, []byte("packet 0"))
 	<-enqueuer.Packets
 
-	enqueuer.mu.Lock()
-	defer enqueuer.mu.Unlock()
-	if len(enqueuer.removedNackSeqs) != 1 || enqueuer.removedNackSeqs[0] != 0 {
-		t.Fatalf("expected queued NACK purge for seq 0, got %#v", enqueuer.removedNackSeqs)
+	// The NACK purge is recorded by the ARQ worker asynchronously, possibly
+	// after the packet is enqueued — poll until it lands instead of racing it.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		enqueuer.mu.Lock()
+		got := append([]uint16(nil), enqueuer.removedNackSeqs...)
+		enqueuer.mu.Unlock()
+		if len(got) == 1 && got[0] == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected queued NACK purge for seq 0, got %#v", got)
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }
 
@@ -1959,12 +1969,12 @@ func TestARQ_ClientGracefulCloseWriteFailureQueuesCloseWrite(t *testing.T) {
 
 	select {
 	case <-conn.writeCh:
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(3 * time.Second): // generous: the race detector slows execution
 		t.Fatal("timed out waiting for client graceful-close write attempt")
 	}
 
 	var sawCloseWrite bool
-	deadline := time.After(1 * time.Second)
+	deadline := time.After(5 * time.Second)
 	for !sawCloseWrite {
 		select {
 		case packet := <-enqueuer.Packets:

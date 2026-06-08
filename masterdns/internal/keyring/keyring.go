@@ -31,8 +31,9 @@ type Entry struct {
 }
 
 type keyringFile struct {
-	Version   int     `json:"version"`
-	Instances []Entry `json:"instances"`
+	Version    int     `json:"version"`
+	Generation uint64  `json:"generation,omitempty"`
+	Instances  []Entry `json:"instances"`
 }
 
 // ring holds the ordered codecs for a single domain. The first codec that
@@ -45,8 +46,23 @@ type ring struct {
 
 // Resolver maps normalized domain -> ring.
 type Resolver struct {
-	rings   map[string]*ring
-	domains []string
+	rings      map[string]*ring
+	domains    []string
+	generation uint64
+}
+
+// Generation returns the panel-assigned generation of this keyring (F04).
+func (r *Resolver) Generation() uint64 {
+	if r == nil {
+		return 0
+	}
+	return r.generation
+}
+
+// WriteApplied records the generation the server has actually loaded, next to
+// the keyring file, so the panel can confirm desired vs applied state (F04).
+func WriteApplied(keyringPath string, generation uint64) error {
+	return os.WriteFile(keyringPath+".applied", []byte(fmt.Sprintf("%d\n", generation)), 0o600)
 }
 
 func normalizeDomain(domain string) string {
@@ -63,7 +79,12 @@ func Load(path string) (*Resolver, error) {
 	if err := json.Unmarshal(raw, &kf); err != nil {
 		return nil, fmt.Errorf("parse keyring %s: %w", path, err)
 	}
-	return FromEntries(kf.Instances)
+	r, err := FromEntries(kf.Instances)
+	if err != nil {
+		return nil, err
+	}
+	r.generation = kf.Generation
+	return r, nil
 }
 
 // isAEADMethod reports whether a cipher method authenticates (so multiple keys

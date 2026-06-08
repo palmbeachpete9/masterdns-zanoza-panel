@@ -10,6 +10,7 @@ package dnscache
 import (
 	"bufio"
 	"container/list"
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
@@ -98,6 +99,23 @@ func BuildKey(domain string, qType, qClass uint16) string {
 	binary.BigEndian.PutUint16(key[2:4], qClass)
 	copy(key[4:], domain)
 	return string(key)
+}
+
+// BuildKeyFromQuery derives a cache/in-flight key from the whole DNS query with
+// the 2-byte transaction ID zeroed. Unlike BuildKey it covers every
+// response-relevant field — QNAME/QTYPE/QCLASS *and* EDNS options and the DO
+// (DNSSEC) bit — so a query can never receive a response generated for a
+// materially different query shape, while two queries differing only by
+// transaction ID still share an entry (F22).
+func BuildKeyFromQuery(rawQuery []byte) string {
+	if len(rawQuery) < 12 {
+		return string(rawQuery)
+	}
+	h := sha256.New()
+	var zeroID [2]byte
+	_, _ = h.Write(zeroID[:])
+	_, _ = h.Write(rawQuery[2:])
+	return string(h.Sum(nil))
 }
 
 func getShardIndex(key string) int {

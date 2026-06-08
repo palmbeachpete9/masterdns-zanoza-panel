@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,33 @@ import (
 	"testing"
 	"time"
 )
+
+// F04 — the keyring is stamped with the desired generation, and state() reports
+// desired vs applied (with apply_pending) from the server's applied marker.
+func TestKeyringGenerationAck(t *testing.T) {
+	m := newServerManager(t.TempDir())
+	if err := m.writeKeyring([]Instance{{Domain: "v.example.com", Key: "k", Method: 5}}, 7); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := os.ReadFile(m.keyringPath)
+	var kf keyringFile
+	if err := json.Unmarshal(raw, &kf); err != nil || kf.Generation != 7 {
+		t.Fatalf("generation not stamped into keyring.json: gen=%d err=%v", kf.Generation, err)
+	}
+	if got := readAppliedGeneration(m.keyringPath); got != 0 {
+		t.Fatalf("applied generation should be 0 before ACK, got %d", got)
+	}
+	if err := os.WriteFile(m.keyringPath+".applied", []byte("7\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAppliedGeneration(m.keyringPath); got != 7 {
+		t.Fatalf("applied generation = %d, want 7", got)
+	}
+	st := m.state()
+	if st.DesiredGeneration != 7 {
+		t.Fatalf("desired generation = %d, want 7", st.DesiredGeneration)
+	}
+}
 
 // F13 — a failed persistence must leave live in-memory state unchanged.
 func TestCommitPersistenceFailureLeavesLiveState(t *testing.T) {

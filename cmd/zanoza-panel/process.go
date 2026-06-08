@@ -24,8 +24,9 @@ type keyringEntry struct {
 }
 
 type keyringFile struct {
-	Version   int            `json:"version"`
-	Instances []keyringEntry `json:"instances"`
+	Version    int            `json:"version"`
+	Generation uint64         `json:"generation,omitempty"`
+	Instances  []keyringEntry `json:"instances"`
 }
 
 // RuntimeState is reported to the UI.
@@ -37,6 +38,12 @@ type RuntimeState struct {
 	StartedAt   string `json:"started_at,omitempty"`
 	ExitedAt    string `json:"exited_at,omitempty"`
 	ExitError   string `json:"exit_error,omitempty"`
+	// Generation tracking (F04): DesiredGeneration is the keyring the panel last
+	// pushed; AppliedGeneration is the generation the running server has
+	// acknowledged loading. ApplyPending is true when they differ.
+	DesiredGeneration uint64 `json:"desired_generation"`
+	AppliedGeneration uint64 `json:"applied_generation"`
+	ApplyPending      bool   `json:"apply_pending"`
 }
 
 // serverManager supervises the single MasterDnsVPN server process and keeps
@@ -57,9 +64,10 @@ type serverManager struct {
 	exitErr      string
 	lastApplyErr string
 
-	desiredUp bool      // operator intent: should the server be running?
-	restarts  int       // auto-restarts within the current crash window
-	windowAt  time.Time // start of the current crash-loop window
+	desiredUp  bool      // operator intent: should the server be running?
+	restarts   int       // auto-restarts within the current crash window
+	windowAt   time.Time // start of the current crash-loop window
+	desiredGen uint64    // last keyring generation written by the panel (F04)
 }
 
 const (
@@ -78,13 +86,16 @@ func newServerManager(runtimeDir string) *serverManager {
 	}
 }
 
-// writeKeyring renders keyring.json + a base server_config.toml from the
-// current instances.
-func (m *serverManager) writeKeyring(instances []Instance) error {
+// writeKeyring renders keyring.json (stamped with the desired generation) + a
+// base server_config.toml from the current instances.
+func (m *serverManager) writeKeyring(instances []Instance, gen uint64) error {
 	if err := os.MkdirAll(m.runtimeDir, 0o755); err != nil {
 		return err
 	}
-	kf := keyringFile{Version: 1}
+	m.mu.Lock()
+	m.desiredGen = gen
+	m.mu.Unlock()
+	kf := keyringFile{Version: 1, Generation: gen}
 	for _, ins := range instances {
 		kf.Instances = append(kf.Instances, keyringEntry{
 			Domain: ins.Domain,
@@ -147,11 +158,11 @@ LOG_LEVEL = "INFO"
 // apply renders the keyring then reloads or (re)starts the server. The whole
 // pipeline is serialized under applyMu so concurrent CRUD can never interleave
 // renders/reloads, and signal/start failures are returned to the caller (F04).
-func (m *serverManager) apply(instances []Instance) error {
+func (m *serverManager) apply(instances []Instance, gen uint64) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
-	if err := m.writeKeyring(instances); err != nil {
+	if err := m.writeKeyring(instances, gen); err != nil {
 		return err
 	}
 
@@ -307,14 +318,14 @@ func (m *serverManager) stop() {
 	}
 }
 
-func (m *serverManager) restart(instances []Instance) error {
+func (m *serverManager) restart(instances []Instance, gen uint64) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 	m.stop()
 	if len(instances) == 0 {
 		return nil
 	}
-	if err := m.writeKeyring(instances); err != nil {
+	if err := m.writeKeyring(instances, gen); err != nil {
 		return err
 	}
 	return m.start()
@@ -341,7 +352,26 @@ func (m *serverManager) state() RuntimeState {
 			st.ExitedAt = m.exitedAt.UTC().Format(time.RFC3339)
 		}
 	}
+	// Desired vs applied generation (F04): the panel knows what it wrote; the
+	// running server records what it actually loaded in keyring.json.applied.
+	st.DesiredGeneration = m.desiredGen
+	st.AppliedGeneration = readAppliedGeneration(m.keyringPath)
+	st.ApplyPending = st.Running && st.AppliedGeneration != st.DesiredGeneration
 	return st
+}
+
+// readAppliedGeneration reads the generation the MasterDNS server acknowledged
+// loading (written next to keyring.json). Returns 0 if absent/unreadable (F04).
+func readAppliedGeneration(keyringPath string) uint64 {
+	raw, err := os.ReadFile(keyringPath + ".applied")
+	if err != nil {
+		return 0
+	}
+	n, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // processMemoryBytes reads RSS from /proc on Linux; best-effort elsewhere.

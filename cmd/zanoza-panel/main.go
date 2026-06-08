@@ -108,7 +108,7 @@ func main() {
 
 	// Bring the MasterDnsVPN server up if instances already exist.
 	if len(cfg.snapshot()) > 0 {
-		if err := manager.apply(cfg.snapshot()); err != nil {
+		if err := manager.apply(cfg.snapshot(), cfg.Generation()); err != nil {
 			log.Printf("masterdns start: %v", err)
 		}
 	}
@@ -124,7 +124,7 @@ func main() {
 				// interleave with an HTTP mutation, and s.cfg identity stays
 				// stable (no stale-pointer handler) (F13).
 				srv.config().publishReload(reloaded)
-				_ = manager.apply(srv.config().snapshot())
+				_ = manager.apply(srv.config().snapshot(), srv.config().Generation())
 				log.Printf("reloaded config")
 			}
 		}
@@ -680,7 +680,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if err := s.manager.restart(s.config().snapshot()); err != nil {
+	if err := s.manager.restart(s.config().snapshot(), s.config().Generation()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -688,7 +688,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
-	if err := s.manager.apply(s.config().snapshot()); err != nil {
+	if err := s.manager.apply(s.config().snapshot(), s.config().Generation()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -715,7 +715,7 @@ func (s *server) mutateInstances(fn func([]Instance) ([]Instance, error)) error 
 	// (re)start/reload the MasterDnsVPN server (e.g. binary missing on a dev
 	// box) must NOT roll back the CRUD operation — it surfaces separately via
 	// state.server.exit_error / apply_error.
-	if err := s.manager.apply(cfg.snapshot()); err != nil {
+	if err := s.manager.apply(cfg.snapshot(), cfg.Generation()); err != nil {
 		log.Printf("masterdns apply: %v", err)
 	}
 	return nil

@@ -168,6 +168,12 @@ func main() {
 	srv := UDPServer.New(cfg, log, codec)
 	if keyResolver != nil {
 		srv.SetKeyResolver(keyResolver)
+		// Acknowledge the initially-loaded generation (F04).
+		if keyringPath != "" {
+			if err := keyring.WriteApplied(keyringPath, keyResolver.Generation()); err != nil {
+				log.Errorf("❌ <red>Keyring Applied-Marker Write Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
+			}
+		}
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

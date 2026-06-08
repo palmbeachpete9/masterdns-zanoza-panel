@@ -106,7 +106,10 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 		return response
 	}
 
-	cacheKey := dnscache.BuildKey(parsed.FirstQuestion.Name, parsed.FirstQuestion.Type, parsed.FirstQuestion.Class)
+	// Key on the full query shape (QNAME/type/class + EDNS/DNSSEC), not just the
+	// first question's name/type/class, so differing EDNS/DO queries never share
+	// a cached or in-flight response (F22).
+	cacheKey := dnscache.BuildKeyFromQuery(rawQuery)
 	now := time.Now()
 	if cached, ok := s.dnsCache.GetReady(cacheKey, rawQuery, now); ok {
 		if s.log != nil {

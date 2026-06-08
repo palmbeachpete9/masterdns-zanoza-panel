@@ -2825,7 +2825,14 @@ func (a *ARQ) finalizeClose(reason string) {
 // - SendCloseWrite: local write side ended; peer should stop sending to us
 // - SendRST: reset close, optionally after drain
 func (a *ARQ) Close(reason string, opts CloseOptions) {
-	if a.isVirtual && !opts.Force {
+	// Read isVirtual under the lock: Close can be invoked concurrently from an
+	// ARQ worker (e.g. ioLoop on EOF) and from the owner, and the other branch
+	// writes a.isVirtual under the lock — an unsynchronized read here was a data
+	// race (F16).
+	a.mu.Lock()
+	isVirtual := a.isVirtual
+	a.mu.Unlock()
+	if isVirtual && !opts.Force {
 		return
 	}
 
