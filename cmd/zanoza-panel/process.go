@@ -220,12 +220,12 @@ func (m *serverManager) startLocked() error {
 // backoff and a crash-loop ceiling; a deliberate stop is not restarted (F09).
 func (m *serverManager) reap(cmd *exec.Cmd, done chan struct{}) {
 	err := cmd.Wait()
-	close(done)
 
 	m.mu.Lock()
 	if m.cmd != cmd {
 		// Superseded by a newer generation; do not clobber its state.
 		m.mu.Unlock()
+		close(done)
 		return
 	}
 	m.cmd = nil
@@ -234,28 +234,42 @@ func (m *serverManager) reap(cmd *exec.Cmd, done chan struct{}) {
 	if err != nil {
 		m.exitErr = err.Error()
 	}
-	if !m.desiredUp {
-		m.mu.Unlock()
-		return // deliberate stop
-	}
 
-	now := time.Now()
-	if now.Sub(m.windowAt) > crashWindow {
-		m.windowAt = now
-		m.restarts = 0
+	restart := false
+	var backoff time.Duration
+	var attempt int
+	var crashLoopMsg string
+	if m.desiredUp {
+		now := time.Now()
+		if now.Sub(m.windowAt) > crashWindow {
+			m.windowAt = now
+			m.restarts = 0
+		}
+		m.restarts++
+		if m.restarts > maxRestarts {
+			crashLoopMsg = fmt.Sprintf("masterdns crash loop: %d restarts within %s; supervisor stopped", m.restarts, crashWindow)
+			m.lastApplyErr = crashLoopMsg
+			m.desiredUp = false
+		} else {
+			restart = true
+			attempt = m.restarts
+			backoff = time.Duration(m.restarts) * restartBackoff
+		}
 	}
-	m.restarts++
-	if m.restarts > maxRestarts {
-		m.lastApplyErr = fmt.Sprintf("masterdns crash loop: %d restarts within %s; supervisor stopped", m.restarts, crashWindow)
-		m.desiredUp = false
-		m.mu.Unlock()
-		log.Printf("masterdns: %s", m.lastApplyErr)
-		return
-	}
-	backoff := time.Duration(m.restarts) * restartBackoff
 	m.mu.Unlock()
 
-	log.Printf("masterdns exited (%v); auto-restart in %s (attempt %d/%d)", err, backoff, m.restarts, maxRestarts)
+	// Process state is now fully cleared under the lock; only AFTER that do we
+	// signal completion, so a concurrent stop()/restart() waiting on done can
+	// never observe stale m.cmd/m.pid (F09).
+	close(done)
+
+	if crashLoopMsg != "" {
+		log.Printf("masterdns: %s", crashLoopMsg)
+	}
+	if !restart {
+		return
+	}
+	log.Printf("masterdns exited (%v); auto-restart in %s (attempt %d/%d)", err, backoff, attempt, maxRestarts)
 	go func() {
 		time.Sleep(backoff)
 		m.mu.Lock()

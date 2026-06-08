@@ -242,9 +242,9 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 		node.entry.QuestionType = qType
 		node.entry.QuestionClass = qClass
 		node.entry.Status = StatusReady
-		if node.entry.CreatedAt.IsZero() {
-			node.entry.CreatedAt = now
-		}
+		// A (re)resolved response resets the absolute TTL clock; CreatedAt is
+		// the insertion time and is never advanced by a cache hit (N02).
+		node.entry.CreatedAt = now
 		node.entry.LastUsedAt = now
 		node.entry.Response = normalized
 		s.dirty.Add(1)
@@ -324,7 +324,10 @@ func (s *Store) isExpired(entry *Entry, now time.Time) bool {
 	if entry.Status == StatusPending {
 		return false
 	}
-	return now.Sub(entry.LastUsedAt) >= s.cacheTTL
+	// Absolute TTL from insertion (N02): a frequently-hit entry must still
+	// expire so stale records cannot live forever. LastUsedAt is for LRU
+	// eviction ordering only.
+	return now.Sub(entry.CreatedAt) >= s.cacheTTL
 }
 
 func (s *Store) evictIfNeededLocked(shard *shard) {

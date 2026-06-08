@@ -9,6 +9,7 @@ package udpserver
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -85,7 +86,39 @@ func (s *Server) dialSOCKSStreamTargetContext(ctx context.Context, host string, 
 	if !s.useExternalSOCKS5 || len(targetPayload) == 0 {
 		return s.dialTCPTargetContext(ctx, net.JoinHostPort(pinnedIP, strconv.Itoa(int(port))))
 	}
-	return s.dialExternalSOCKS5TargetContext(ctx, targetPayload)
+	// External SOCKS mode must also use the validated/pinned IP — never forward
+	// the original hostname, or the upstream proxy would re-resolve it outside
+	// the validation boundary (DNS rebinding) (F19).
+	pinnedPayload, err := socksAddrPayload(pinnedIP, port)
+	if err != nil {
+		return nil, &blockedSOCKSTargetError{host: host}
+	}
+	return s.dialExternalSOCKS5TargetContext(ctx, pinnedPayload)
+}
+
+// socksAddrPayload builds a SOCKS5 address field (ATYP + ADDR + PORT) from a
+// numeric IP, never a hostname — so authorization cannot be bypassed (F19).
+func socksAddrPayload(ip string, port uint16) ([]byte, error) {
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		return nil, fmt.Errorf("invalid pinned ip %q", ip)
+	}
+	if v4 := parsed.To4(); v4 != nil {
+		b := make([]byte, 1+net.IPv4len+2)
+		b[0] = 0x01 // ATYP IPv4
+		copy(b[1:1+net.IPv4len], v4)
+		binary.BigEndian.PutUint16(b[1+net.IPv4len:], port)
+		return b, nil
+	}
+	v6 := parsed.To16()
+	if v6 == nil {
+		return nil, fmt.Errorf("invalid pinned ip %q", ip)
+	}
+	b := make([]byte, 1+net.IPv6len+2)
+	b[0] = 0x04 // ATYP IPv6
+	copy(b[1:1+net.IPv6len], v6)
+	binary.BigEndian.PutUint16(b[1+net.IPv6len:], port)
+	return b, nil
 }
 
 // validateSOCKSTargetHost is the cheap, no-DNS pre-check used to reject an
@@ -124,7 +157,7 @@ func (s *Server) authorizeSOCKSTarget(ctx context.Context, host string) (string,
 	}
 
 	if ip := net.ParseIP(name); ip != nil {
-		if isBlockedTargetIP(ip) {
+		if isBlockedTargetIP(ip) || isLocalInterfaceIP(ip) {
 			return "", &blockedSOCKSTargetError{host: host}
 		}
 		return ip.String(), nil
@@ -139,11 +172,34 @@ func (s *Server) authorizeSOCKSTarget(ctx context.Context, host string) (string,
 		return "", &blockedSOCKSTargetError{host: host}
 	}
 	for _, a := range addrs {
-		if isBlockedTargetIP(a.IP) {
+		if isBlockedTargetIP(a.IP) || isLocalInterfaceIP(a.IP) {
 			return "", &blockedSOCKSTargetError{host: host}
 		}
 	}
 	return addrs[0].IP.String(), nil
+}
+
+// isLocalInterfaceIP reports whether ip is bound to one of this host's
+// interfaces, blocking hairpin/SSRF access to services on the server's own
+// public address (F19). Best-effort: a failed enumeration does not block.
+func isLocalInterfaceIP(ip net.IP) bool {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		var local net.IP
+		switch v := a.(type) {
+		case *net.IPNet:
+			local = v.IP
+		case *net.IPAddr:
+			local = v.IP
+		}
+		if local != nil && local.Equal(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // isBlockedTargetIP reports whether an IP must never be a SOCKS egress target:

@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 env:
-  GO_VERSION: "1.25.4"
+  # Security patch floor (N01): must be >= the latest fixed stdlib patch level.
+  GO_VERSION: "1.25.11"
 
 jobs:
   go-panel:
@@ -21,9 +22,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      - run: go version
       - run: go vet ./cmd/...
       - run: go test -shuffle=on -count=2 ./cmd/...
       - run: go test -race -shuffle=on -count=1 ./cmd/...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   go-masterdns:
     name: MasterDNS (nested module)
@@ -40,7 +44,9 @@ jobs:
           cache-dependency-path: masterdns/go.sum
       - run: go vet ./...
       - run: go test -shuffle=on -count=2 ./...
-      - run: go test -race -shuffle=on -count=1 ./...
+      - run: go test -race -shuffle=on -count=10 ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
   lint:
     name: golangci-lint + gofumpt
@@ -58,7 +64,7 @@ jobs:
           if [ -n "$out" ]; then echo "Unformatted files:"; echo "$out"; exit 1; fi
 
   frontend:
-    name: Frontend build + typecheck
+    name: Frontend build + typecheck + audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -69,15 +75,18 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm run build
-      - run: npm audit --omit=dev || true
+      # Production dependencies must have zero vulnerabilities (enforced, N03).
+      - run: npm audit --omit=dev --audit-level=low
+      # Full audit (incl. dev-server tooling) is informational; the remaining
+      # advisories are dev-only Vite/esbuild dev-server issues (reviewed).
+      - run: npm audit || true
 
   shell:
     name: Shell syntax + ShellCheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Use the distro shellcheck instead of a mutable third-party action (F27).
+      - run: sudo apt-get update && sudo apt-get install -y shellcheck
       - run: bash -n scripts/install.sh scripts/zanoza
-      - uses: ludeeus/action-shellcheck@master
-        with:
-          severity: warning
-          scandir: scripts
+      - run: shellcheck --severity=warning scripts/install.sh scripts/zanoza

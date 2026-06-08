@@ -66,19 +66,39 @@ func Load(path string) (*Resolver, error) {
 	return FromEntries(kf.Instances)
 }
 
-// FromEntries builds a resolver from already-parsed entries.
+// isAEADMethod reports whether a cipher method authenticates (so multiple keys
+// can be safely trial-decrypted on one domain). Mirrors the panel's rule (F06).
+func isAEADMethod(method int) bool { return method >= 2 }
+
+// FromEntries builds a resolver from already-parsed entries. The runtime loader
+// does NOT trust panel validation: it canonicalizes domains, rejects duplicate
+// keys within a (canonical) domain, and refuses to load any canonical domain
+// that holds 2+ keys unless every method is AEAD — so legacy/canonical-collision
+// configs fail closed instead of silently merging unsafe keys (F06).
 func FromEntries(entries []Entry) (*Resolver, error) {
 	r := &Resolver{rings: map[string]*ring{}}
 	seenDomain := map[string]bool{}
+	keysPerDomain := map[string]map[string]struct{}{}
+	methodsPerDomain := map[string][]int{}
+
 	for _, e := range entries {
 		domain := normalizeDomain(e.Domain)
 		if domain == "" {
-			continue
+			return nil, fmt.Errorf("empty domain in keyring")
 		}
 		key := strings.TrimSpace(e.Key)
 		if key == "" {
 			return nil, fmt.Errorf("empty key for domain %q", domain)
 		}
+		if keysPerDomain[domain] == nil {
+			keysPerDomain[domain] = map[string]struct{}{}
+		}
+		if _, dup := keysPerDomain[domain][key]; dup {
+			return nil, fmt.Errorf("duplicate key on domain %q", domain)
+		}
+		keysPerDomain[domain][key] = struct{}{}
+		methodsPerDomain[domain] = append(methodsPerDomain[domain], e.Method)
+
 		codec, err := security.NewCodec(e.Method, key)
 		if err != nil {
 			return nil, fmt.Errorf("codec for domain %q: %w", domain, err)
@@ -93,6 +113,17 @@ func FromEntries(entries []Entry) (*Resolver, error) {
 			}
 		}
 		grp.codecs = append(grp.codecs, codec)
+	}
+
+	for domain, methods := range methodsPerDomain {
+		if len(methods) < 2 {
+			continue
+		}
+		for _, m := range methods {
+			if !isAEADMethod(m) {
+				return nil, fmt.Errorf("domain %q holds %d keys but method %d is not AEAD; refusing to load (canonical collision?)", domain, len(methods), m)
+			}
+		}
 	}
 	return r, nil
 }

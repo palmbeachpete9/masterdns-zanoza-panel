@@ -1064,9 +1064,17 @@ func TestDialSOCKSStreamTargetUsesExternalProxyWhenEnabled(t *testing.T) {
 		gotAddress = address
 		return conn, nil
 	}
+	// Resolve the hostname to a fixed public IP so the proxy request is built
+	// from the validated/pinned IP, never the original hostname (F19).
+	s.resolveIPAddrFn = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
 
-	targetPayload := []byte{0x03, 0x0b, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb}
-	upstream, err := s.dialSOCKSStreamTargetContext(context.Background(), "example.com", 443, targetPayload)
+	// Hostname payload from the client; the proxy must NOT receive it.
+	hostnamePayload := []byte{0x03, 0x0b, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb}
+	// Expected: numeric IPv4 ATYP payload for 93.184.216.34:443.
+	wantPayload := []byte{0x01, 93, 184, 216, 34, 0x01, 0xbb}
+	upstream, err := s.dialSOCKSStreamTargetContext(context.Background(), "example.com", 443, hostnamePayload)
 	if err != nil {
 		t.Fatalf("unexpected external SOCKS5 dial error: %v", err)
 	}
@@ -1085,11 +1093,14 @@ func TestDialSOCKSStreamTargetUsesExternalProxyWhenEnabled(t *testing.T) {
 	if got := conn.writes[0]; len(got) != 3 || got[0] != 0x05 || got[1] != 0x01 || got[2] != 0x00 {
 		t.Fatalf("unexpected greeting bytes: %v", got)
 	}
-	if got := conn.writes[1]; len(got) != 3+len(targetPayload) || got[0] != 0x05 || got[1] != 0x01 || got[2] != 0x00 {
+	if got := conn.writes[1]; len(got) != 3+len(wantPayload) || got[0] != 0x05 || got[1] != 0x01 || got[2] != 0x00 {
 		t.Fatalf("unexpected connect request header: %v", got)
 	}
-	if got := conn.writes[1][3:]; !equalBytes(got, targetPayload) {
-		t.Fatalf("unexpected target payload forwarded to external proxy: got=%v want=%v", got, targetPayload)
+	if got := conn.writes[1][3:]; equalBytes(got, hostnamePayload) {
+		t.Fatal("external proxy must not receive the original hostname payload (F19)")
+	}
+	if got := conn.writes[1][3:]; !equalBytes(got, wantPayload) {
+		t.Fatalf("unexpected target payload forwarded to external proxy: got=%v want=%v (pinned IP)", got, wantPayload)
 	}
 	if conn.deadlineActive {
 		t.Fatal("expected SOCKS5 path to clear connection deadline after successful handshake")
@@ -1111,6 +1122,9 @@ func TestDialSOCKSStreamTargetExternalProxyDetachesSuccessfulConnFromHandshakeCo
 
 	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return conn, nil
+	}
+	s.resolveIPAddrFn = func(context.Context, string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
 	}
 
 	targetPayload := []byte{0x03, 0x0b, 'e', 'x', 'a', 'm', 'p', 'l', 'e', '.', 'c', 'o', 'm', 0x01, 0xbb}

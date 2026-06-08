@@ -19,15 +19,15 @@ REF="${ZANOZA_REF:-main}"
 SRC_DIR="${ZANOZA_SRC_DIR:-/opt/masterdns-zanoza-panel}"
 CONFIG_DIR="${ZANOZA_CONFIG_DIR:-/etc/zanoza-panel}"
 CONFIG_PATH="$CONFIG_DIR/config.json"
-ENV_PATH="$CONFIG_DIR/panel.env"
 TLS_CERT="$CONFIG_DIR/tls.crt"
 TLS_KEY="$CONFIG_DIR/tls.key"
 PANEL_BIN="/usr/local/bin/zanoza-panel"
 SERVER_BIN="/usr/local/bin/masterdns-server"
 CLI_BIN="/usr/local/bin/zanoza"
-# Must satisfy the `go 1.25.0` directive in go.mod / masterdns/go.mod (F17).
-GO_VERSION="${GO_VERSION:-1.25.4}"
-GO_MIN_VERSION="1.25.0"
+# Pin to a Go patch level at/above the known-fixed stdlib floor (N01), which is
+# also >= the `go 1.25.0` directive in go.mod / masterdns/go.mod (F17).
+GO_VERSION="${GO_VERSION:-1.25.11}"
+GO_MIN_VERSION="1.25.11"
 # Optional pinned Go toolchain SHA-256 (linux). When set (env or here), the
 # downloaded tarball is verified before extraction; otherwise the official
 # checksum published at go.dev is fetched and enforced (F27).
@@ -58,6 +58,28 @@ random_port() {
 # so under `set -o pipefail` the SIGPIPE (141) would abort the script. The
 # trailing `|| true` swallows it; the N chars are already on stdout.
 random_alnum() { LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c "$1" || true; }
+
+# valid_port echoes a port in 1..65535 or fails (F14).
+valid_port() {
+	case "$1" in
+		''|*[!0-9]*) return 1;;
+	esac
+	[ "$1" -ge 1 ] && [ "$1" -le 65535 ] || return 1
+	printf '%s' "$1"
+}
+
+# norm_path applies the backend's panel-path rules: one leading slash, no bare
+# root, no trailing/nested slash, no whitespace/query/fragment characters (F14).
+norm_path() {
+	local p="${1#"${1%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}" # trim
+	[ -n "$p" ] || return 1
+	[ "${p#/}" = "$p" ] && p="/$p"
+	p="/$(printf '%s' "$p" | sed 's#^/*##; s#/*$##')"
+	[ "$p" = "/" ] && return 1
+	case "$p" in */*/*) return 1;; esac
+	case "$p" in *' '*|*'?'*|*'#'*|*'%'*) return 1;; esac
+	printf '%s' "$p"
+}
 
 # --------------------------------------------------------------------------
 # Packages + Go
@@ -94,12 +116,19 @@ ensure_go() {
 	case "$arch" in amd64) arch=amd64;; arm64) arch=arm64;; *) die "неизвестная архитектура: $arch";; esac
 	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o /tmp/go.tgz || die "не удалось скачать Go"
 	local want; want="$(go_expected_sha256 "$arch")"
-	if [ -n "$want" ]; then
+	if [ -z "$want" ]; then
+		# Fail closed: never extract an unverified toolchain (F27). An operator
+		# can pin GO_SHA256_${arch} or set ZANOZA_ALLOW_UNVERIFIED_GO=1 to override.
+		if [ "${ZANOZA_ALLOW_UNVERIFIED_GO:-0}" = "1" ]; then
+			warn "контрольная сумма Go не получена; проверка отключена (ZANOZA_ALLOW_UNVERIFIED_GO=1)."
+		else
+			rm -f /tmp/go.tgz
+			die "не удалось получить контрольную сумму Go ${GO_VERSION}; установка прервана (задайте GO_SHA256_${arch} или ZANOZA_ALLOW_UNVERIFIED_GO=1)."
+		fi
+	else
 		local got; got="$(sha256sum /tmp/go.tgz | awk '{print $1}')"
 		[ "$got" = "$want" ] || { rm -f /tmp/go.tgz; die "контрольная сумма Go не совпала (ожидалось ${want}, получено ${got})"; }
 		log "Go tarball verified (sha256 ok)."
-	else
-		warn "не удалось получить контрольную сумму Go — пропускаю проверку (задайте GO_SHA256_${arch})."
 	fi
 	rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz
 	rm -f /tmp/go.tgz
@@ -136,6 +165,9 @@ mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/masterdns"
 # Prompts: port, path, certificate (3x-ui style) — fresh install only.
 # Update mode preserves all of this (F10).
 # --------------------------------------------------------------------------
+# SERVER_IP is needed by BOTH install and update branches (F10).
+SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
 if [ "$MODE" = "update" ]; then
 	[ -f "$CONFIG_PATH" ] || die "обновление невозможно: $CONFIG_PATH не найден (сначала установите панель)"
 	command -v python3 >/dev/null 2>&1 || die "python3 требуется для обновления"
@@ -149,16 +181,24 @@ if [ "$MODE" = "update" ]; then
 else
 PORT="$(random_port)"
 ans="$(read_tty "A random port will be assigned. Customise? y/N: " "N")"
-case "$ans" in y|Y) PORT="$(read_tty "Введите порт: " "$PORT")";; esac
+case "$ans" in y|Y)
+	while :; do
+		p="$(read_tty "Введите порт: " "$PORT")"
+		if PORT="$(valid_port "$p")"; then break; fi
+		warn "порт должен быть числом 1..65535"
+	done;;
+esac
 
 PANEL_PATH="/admin"
 ans="$(read_tty "Path /admin will be assigned. Customise? y/N: " "N")"
 case "$ans" in y|Y)
-	p="$(read_tty "Введите путь (например /secret): " "/admin")"
-	[ "${p:0:1}" = "/" ] || p="/$p"; PANEL_PATH="$p";;
+	while :; do
+		p="$(read_tty "Введите путь (например /secret): " "/admin")"
+		if PANEL_PATH="$(norm_path "$p")"; then break; fi
+		warn "путь должен быть вида /secret (без пробелов, ? # %, вложенных слешей, и не «/»)"
+	done;;
 esac
 
-SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 PANEL_ADDR="0.0.0.0"
 USE_TLS=1
 CERT_HOST="$SERVER_IP"
@@ -237,6 +277,11 @@ case "$cert_choice" in
 		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_REF}) для ${domain}..."
 		acme_tarball="/tmp/acme-${ACME_SH_REF}.tar.gz"
 		if curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_REF}.tar.gz" -o "$acme_tarball"; then
+			# Verify the tarball against a pinned checksum when provided (F27).
+			if [ -n "${ACME_SH_SHA256:-}" ]; then
+				got="$(sha256sum "$acme_tarball" | awk '{print $1}')"
+				[ "$got" = "$ACME_SH_SHA256" ] || { rm -f "$acme_tarball"; die "контрольная сумма acme.sh не совпала"; }
+			fi
 			tar -xzf "$acme_tarball" -C /tmp
 			( cd "/tmp/acme.sh-${ACME_SH_REF}" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
 			rm -rf "$acme_tarball" "/tmp/acme.sh-${ACME_SH_REF}"
@@ -272,15 +317,11 @@ esac
 # --------------------------------------------------------------------------
 ADMIN_USER="$(random_alnum 10)"
 ADMIN_PASS="$(random_alnum 20)"
-SALT="$(openssl rand -hex 16)"
-PASS_HASH="$(printf '%s' "${SALT}:${ADMIN_PASS}" | sha256sum | awk '{print $1}')"
-
 umask 077
-cat > "$ENV_PATH" <<EOF
-ZANOZA_PANEL_USER='${ADMIN_USER}'
-ZANOZA_PANEL_SALT='${SALT}'
-ZANOZA_PANEL_PASS_HASH='${PASS_HASH}'
-EOF
+# Use the freshly built panel binary to hash + persist credentials with bcrypt
+# atomically — no legacy SHA-256 in shell (F07/F24).
+"${PANEL_BIN}.new" -config "$CONFIG_PATH" -set-credentials -user "$ADMIN_USER" -password "$ADMIN_PASS" >/dev/null \
+	|| die "не удалось задать учётные данные администратора"
 
 CERT_JSON=""
 if [ "$USE_TLS" -eq 1 ]; then
@@ -306,29 +347,58 @@ chmod 600 "$CONFIG_PATH"
 fi   # end fresh-install-only block (MODE != update)
 
 # --------------------------------------------------------------------------
-# systemd + CLI + atomic binary swap with rollback (F10)
+# systemd + CLI + atomic swap with full-artifact rollback (F10)
 # --------------------------------------------------------------------------
-install -m 0644 "$SRC_DIR/packaging/systemd/zanoza-panel.service" /etc/systemd/system/zanoza-panel.service
-install -m 0755 "$SRC_DIR/scripts/zanoza" "$CLI_BIN"
+UNIT_PATH="/etc/systemd/system/zanoza-panel.service"
 
-# Back up current binaries so a failed start can be rolled back.
+# Back up EVERY replaced artifact (panel + server binaries, unit, CLI) so a
+# failed update is rolled back as one transaction (F10).
 [ -f "$PANEL_BIN" ]  && cp -f "$PANEL_BIN"  "${PANEL_BIN}.bak"
 [ -f "$SERVER_BIN" ] && cp -f "$SERVER_BIN" "${SERVER_BIN}.bak"
+[ -f "$UNIT_PATH" ]  && cp -f "$UNIT_PATH"  "${UNIT_PATH}.bak"
+[ -f "$CLI_BIN" ]    && cp -f "$CLI_BIN"    "${CLI_BIN}.bak"
+
+install -m 0644 "$SRC_DIR/packaging/systemd/zanoza-panel.service" "$UNIT_PATH"
+install -m 0755 "$SRC_DIR/scripts/zanoza" "$CLI_BIN"
 mv -f "${PANEL_BIN}.new"  "$PANEL_BIN"
 mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
+
+rollback_update() {
+	warn "$1 — откат к предыдущей версии."
+	[ -f "${PANEL_BIN}.bak" ]  && mv -f "${PANEL_BIN}.bak"  "$PANEL_BIN"
+	[ -f "${SERVER_BIN}.bak" ] && mv -f "${SERVER_BIN}.bak" "$SERVER_BIN"
+	[ -f "${UNIT_PATH}.bak" ]  && mv -f "${UNIT_PATH}.bak"  "$UNIT_PATH"
+	[ -f "${CLI_BIN}.bak" ]    && mv -f "${CLI_BIN}.bak"    "$CLI_BIN"
+	systemctl daemon-reload 2>/dev/null || true
+	systemctl restart zanoza-panel 2>/dev/null || true
+	die "обновление откатано: $1"
+}
 
 systemctl daemon-reload
 systemctl enable zanoza-panel >/dev/null 2>&1 || true
 systemctl restart zanoza-panel || true
 sleep 2
 if ! systemctl is-active --quiet zanoza-panel; then
-	warn "панель не запустилась — откат к предыдущим бинарникам."
-	[ -f "${PANEL_BIN}.bak" ]  && mv -f "${PANEL_BIN}.bak"  "$PANEL_BIN"
-	[ -f "${SERVER_BIN}.bak" ] && mv -f "${SERVER_BIN}.bak" "$SERVER_BIN"
-	systemctl restart zanoza-panel || true
-	die "обновление откатано: новая сборка не запустилась."
+	rollback_update "панель не запустилась"
 fi
-rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak"
+
+# If hosts are configured, the supervised MasterDNS child must come up too
+# (a live panel alone is not a healthy update). Allow a few seconds for the
+# panel's supervisor to start it (F10).
+HAS_INSTANCES=0
+if command -v python3 >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
+	python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('instances') else 1)" && HAS_INSTANCES=1 || true
+fi
+if [ "$HAS_INSTANCES" = "1" ]; then
+	ok=0
+	for _ in 1 2 3 4 5 6; do
+		if pgrep -f "$SERVER_BIN" >/dev/null 2>&1; then ok=1; break; fi
+		sleep 1
+	done
+	[ "$ok" = "1" ] || rollback_update "MasterDNS-сервер не запустился (хосты настроены)"
+fi
+
+rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak" "${UNIT_PATH}.bak" "${CLI_BIN}.bak"
 
 if [ "$MODE" = "update" ]; then
 	SCHEME="https"; [ "$USE_TLS" -eq 1 ] || SCHEME="http"

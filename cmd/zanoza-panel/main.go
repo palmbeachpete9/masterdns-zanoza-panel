@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -41,7 +42,23 @@ type server struct {
 
 func main() {
 	configPath := flag.String("config", envDefault(EnvConfig, "/etc/zanoza-panel/config.json"), "path to panel config JSON")
+	setCreds := flag.Bool("set-credentials", false, "set admin credentials (bcrypt) from -user/-password and exit")
+	credUser := flag.String("user", "", "username for -set-credentials")
+	credPass := flag.String("password", "", "password for -set-credentials")
 	flag.Parse()
+
+	// Credential management subcommand: lets the installer and `zanoza
+	// resetcreds` reuse the backend's bcrypt + atomic-persist path instead of
+	// writing legacy SHA-256 in shell (F07/F24).
+	if *setCreds {
+		configDir := filepath.Dir(*configPath)
+		creds := loadCredentials(filepath.Join(configDir, "panel.env"))
+		if err := creds.set(*credUser, *credPass); err != nil {
+			log.Fatalf("set credentials: %v", err)
+		}
+		fmt.Println("credentials updated")
+		return
+	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
@@ -103,10 +120,11 @@ func main() {
 		for range ch {
 			if reloaded, err := loadConfig(*configPath); err == nil {
 				applyEnvOverrides(reloaded)
-				srv.mu.Lock()
-				srv.cfg = reloaded
-				srv.mu.Unlock()
-				_ = manager.apply(reloaded.snapshot())
+				// Publish in place under the commit coordinator so reload can't
+				// interleave with an HTTP mutation, and s.cfg identity stays
+				// stable (no stale-pointer handler) (F13).
+				srv.config().publishReload(reloaded)
+				_ = manager.apply(srv.config().snapshot())
 				log.Printf("reloaded config")
 			}
 		}
@@ -156,6 +174,16 @@ func isLoopbackAddr(addr string) bool {
 // route dispatches by the configured panel path; everything outside it is a
 // decoy 404 so the admin surface stays hidden.
 func (s *server) route(w http.ResponseWriter, r *http.Request) {
+	// Baseline security headers on every response (N04).
+	h := w.Header()
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "DENY")
+	h.Set("Content-Security-Policy", "frame-ancestors 'none'")
+	h.Set("Referrer-Policy", "no-referrer")
+	if s.useTLS {
+		h.Set("Strict-Transport-Security", "max-age=31536000")
+	}
+
 	s.mu.Lock()
 	path := s.cfg.PanelPath
 	s.mu.Unlock()
@@ -254,6 +282,7 @@ func (s *server) api(w http.ResponseWriter, r *http.Request, rest string) {
 
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store") // authenticated API data is never cached (N04)
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(v)
 }
@@ -328,7 +357,35 @@ func (s *server) requireAuth(w http.ResponseWriter, r *http.Request, next http.H
 		writeErr(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	// CSRF defence: reject cross-origin state-changing requests (N04).
+	if isMutatingMethod(r.Method) && !sameOriginOK(r) {
+		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
+		return
+	}
 	next(w, r)
+}
+
+func isMutatingMethod(m string) bool {
+	switch m {
+	case http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete:
+		return true
+	}
+	return false
+}
+
+// sameOriginOK accepts a request when it carries no Origin (non-browser client)
+// or an Origin whose host:port matches the request Host. Browsers always send
+// Origin on cross-origin requests, so a mismatch is a CSRF attempt (N04).
+func sameOriginOK(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
 }
 
 func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
@@ -417,6 +474,12 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	// POST-only: a top-level GET navigation must not be able to revoke a
+	// session (SameSite=Lax would still send the cookie on GET) (N04).
+	if r.Method != http.MethodPost {
+		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	if c, err := r.Cookie(sessionCookie); err == nil {
 		s.sessions.revoke(c.Value)
 	}
@@ -515,12 +578,13 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			writeBadBody(w, err)
 			return
 		}
-		cfg.mu.Lock()
-		if strings.TrimSpace(body.Name) != "" {
-			cfg.Name = strings.TrimSpace(body.Name)
-		}
-		cfg.mu.Unlock()
-		if err := cfg.save(); err != nil {
+		name := strings.TrimSpace(body.Name)
+		if err := cfg.commit(func(work *Config) error {
+			if name != "" {
+				work.Name = name
+			}
+			return nil
+		}); err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -631,31 +695,26 @@ func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
-// mutateInstances applies fn to a copy of the instance list, persists, and
-// re-applies the keyring to the running server.
+// mutateInstances transactionally applies fn to the instance list: the change
+// is validated + persisted on a clone, and only published to live state after
+// the durable write succeeds (F13). The keyring is then re-applied to the
+// running server.
 func (s *server) mutateInstances(fn func([]Instance) ([]Instance, error)) error {
-	s.mu.Lock()
-	cfg := s.cfg
-	s.mu.Unlock()
-
-	cfg.mu.Lock()
-	working := make([]Instance, len(cfg.Instances))
-	copy(working, cfg.Instances)
-	next, err := fn(working)
-	if err != nil {
-		cfg.mu.Unlock()
+	cfg := s.config()
+	if err := cfg.commit(func(work *Config) error {
+		next, err := fn(work.Instances)
+		if err != nil {
+			return err
+		}
+		work.Instances = next
+		return nil
+	}); err != nil {
 		return err
 	}
-	cfg.Instances = next
-	cfg.mu.Unlock()
-
-	if err := cfg.save(); err != nil {
-		return err
-	}
-	// The config is the source of truth and is now saved. A failure to
-	// (re)start/reload the MasterDnsVPN server (e.g. binary missing on a
-	// dev box) must NOT roll back the CRUD operation — it surfaces
-	// separately via state.server.exit_error.
+	// Config is the source of truth and is durably persisted. A failure to
+	// (re)start/reload the MasterDnsVPN server (e.g. binary missing on a dev
+	// box) must NOT roll back the CRUD operation — it surfaces separately via
+	// state.server.exit_error / apply_error.
 	if err := s.manager.apply(cfg.snapshot()); err != nil {
 		log.Printf("masterdns apply: %v", err)
 	}
