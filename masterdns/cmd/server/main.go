@@ -9,6 +9,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -26,6 +28,16 @@ import (
 	UDPServer "masterdnsvpn-go/internal/udpserver"
 	"masterdnsvpn-go/internal/version"
 )
+
+// keyFingerprint returns a short non-secret identifier for an encryption key so
+// logs can reference "which key" without ever disclosing it (V4-04).
+func keyFingerprint(key string) string {
+	if key == "" {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(key))
+	return "sha256:" + hex.EncodeToString(sum[:6])
+}
 
 func waitForExitInput() {
 	_, _ = fmt.Fprint(os.Stderr, "Press Enter to exit...")
@@ -241,7 +253,9 @@ func main() {
 				keyInfo.Path,
 			)
 		}
-		log.Infof("\U0001F511 <green>Active Encryption Key: <yellow>%s</yellow></green>", keyInfo.Key)
+		// Never log the key itself — only a non-secret fingerprint for ops
+		// identification (V4-04).
+		log.Infof("\U0001F511 <green>Active Encryption Key fingerprint: <yellow>%s</yellow></green>", keyFingerprint(keyInfo.Key))
 	}
 	log.Debugf("\u25B6\uFE0F <green>Starting UDP Server...</green>")
 

@@ -19,8 +19,11 @@ REF="${ZANOZA_REF:-main}"
 SRC_DIR="${ZANOZA_SRC_DIR:-/opt/masterdns-zanoza-panel}"
 CONFIG_DIR="${ZANOZA_CONFIG_DIR:-/etc/zanoza-panel}"
 CONFIG_PATH="$CONFIG_DIR/config.json"
-TLS_CERT="$CONFIG_DIR/tls.crt"
-TLS_KEY="$CONFIG_DIR/tls.key"
+# Certificates live in a ROOT-owned subdir (service-readable via group) so the
+# root renewal job never follows a service-planted symlink (V4-01).
+TLS_DIR="$CONFIG_DIR/certs"
+TLS_CERT="$TLS_DIR/tls.crt"
+TLS_KEY="$TLS_DIR/tls.key"
 SVC_USER="${ZANOZA_SVC_USER:-zanoza}"  # unprivileged service account (R-09)
 PANEL_BIN="/usr/local/bin/zanoza-panel"
 SERVER_BIN="/usr/local/bin/masterdns-server"
@@ -126,7 +129,10 @@ ensure_go() {
 	log "Установка Go ${GO_VERSION}..."
 	local arch; arch="$(dpkg --print-architecture)"
 	case "$arch" in amd64) arch=amd64;; arm64) arch=arm64;; *) die "неизвестная архитектура: $arch";; esac
-	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o /tmp/go.tgz || die "не удалось скачать Go"
+	# Download into a root-owned private temp dir (mode 0700) so an unprivileged
+	# user can't pre-create/symlink the artifact path (V4-01).
+	local td; td="$(mktemp -d)" || die "mktemp не удался"
+	curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${arch}.tar.gz" -o "$td/go.tgz" || { rm -rf "$td"; die "не удалось скачать Go"; }
 	local want; want="$(go_expected_sha256 "$arch")"
 	if [ -z "$want" ]; then
 		# Fail closed: never extract an unverified toolchain (F27). An operator
@@ -134,16 +140,16 @@ ensure_go() {
 		if [ "${ZANOZA_ALLOW_UNVERIFIED_GO:-0}" = "1" ]; then
 			warn "контрольная сумма Go не получена; проверка отключена (ZANOZA_ALLOW_UNVERIFIED_GO=1)."
 		else
-			rm -f /tmp/go.tgz
+			rm -rf "$td"
 			die "не удалось получить контрольную сумму Go ${GO_VERSION}; установка прервана (задайте GO_SHA256_${arch} или ZANOZA_ALLOW_UNVERIFIED_GO=1)."
 		fi
 	else
-		local got; got="$(sha256sum /tmp/go.tgz | awk '{print $1}')"
-		[ "$got" = "$want" ] || { rm -f /tmp/go.tgz; die "контрольная сумма Go не совпала (ожидалось ${want}, получено ${got})"; }
+		local got; got="$(sha256sum "$td/go.tgz" | awk '{print $1}')"
+		[ "$got" = "$want" ] || { rm -rf "$td"; die "контрольная сумма Go не совпала (ожидалось ${want}, получено ${got})"; }
 		log "Go tarball verified (sha256 ok)."
 	fi
-	rm -rf /usr/local/go && tar -C /usr/local -xzf /tmp/go.tgz
-	rm -f /tmp/go.tgz
+	rm -rf /usr/local/go && tar -C /usr/local -xzf "$td/go.tgz"
+	rm -rf "$td"
 	export PATH="/usr/local/go/bin:$PATH"
 }
 ensure_go
@@ -167,15 +173,28 @@ esac
 
 # A failed fetch/reset must NOT silently fall through to building stale local
 # source (F27). On update we hard-fail; on fresh install we clone or die.
-if [ -d "$SRC_DIR/.git" ]; then
-	log "Обновление исходников..."
-	git -C "$SRC_DIR" fetch --depth 1 origin "$REF" || die "git fetch не удался — установка прервана (исходники не изменены)"
-	git -C "$SRC_DIR" reset --hard "FETCH_HEAD" || die "git reset не удался — установка прервана"
-else
-	log "Клонирование $REPO..."
+# Fetch EXACTLY $REF (branch, tag, or commit SHA) and check out FETCH_HEAD. We
+# never fall back to a different ref, so a commit pin is honoured or the install
+# fails (V4-05).
+if [ ! -d "$SRC_DIR/.git" ]; then
+	log "Инициализация исходников из $REPO..."
 	rm -rf "$SRC_DIR"
-	git clone --depth 1 --branch "$REF" "$REPO" "$SRC_DIR" 2>/dev/null || git clone --depth 1 "$REPO" "$SRC_DIR" || die "git clone не удался"
+	git init -q "$SRC_DIR"
+	git -C "$SRC_DIR" remote add origin "$REPO"
 fi
+log "Получение ref '$REF'..."
+git -C "$SRC_DIR" fetch --depth 1 origin "$REF" || die "git fetch '$REF' не удался — установка прервана"
+git -C "$SRC_DIR" checkout -q --force --detach FETCH_HEAD || die "git checkout не удался"
+# If REF is a full commit SHA, prove HEAD matches it exactly (V4-05).
+case "$REF" in
+	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+		head="$(git -C "$SRC_DIR" rev-parse HEAD)"
+		[ "$head" = "$REF" ] || die "ожидался коммит $REF, получен $head — установка прервана"
+		log "Проверено: HEAD = $REF"
+		;;
+esac
+INSTALLED_COMMIT="$(git -C "$SRC_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+log "Сборка из коммита ${INSTALLED_COMMIT}"
 
 # Build to temporary paths; live binaries are only swapped in after BOTH builds
 # succeed, and are rolled back if the service fails to come up (F10).
@@ -184,7 +203,7 @@ log "Сборка панели (web/dist встроен в бинарь)..."
 log "Сборка форка сервера MasterDnsVPN..."
 ( cd "$SRC_DIR/masterdns" && CGO_ENABLED=0 go build -o "${SERVER_BIN}.new" ./cmd/server ) || die "сборка сервера не удалась — установка прервана"
 
-mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/masterdns"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/masterdns" "$TLS_DIR"
 
 # --------------------------------------------------------------------------
 # Prompts: port, path, certificate (3x-ui style) — fresh install only.
@@ -253,8 +272,8 @@ host="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
 openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
   -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" -addext "subjectAltName=IP:\${host}" 2>/dev/null || \
 openssl req -x509 -newkey rsa:2048 -nodes -days 6 -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" 2>/dev/null
-chmod 600 "$TLS_KEY"
-chown ${SVC_USER}:${SVC_USER} "$TLS_CERT" "$TLS_KEY" 2>/dev/null || true
+chown root:${SVC_USER} "$TLS_CERT" "$TLS_KEY" 2>/dev/null || true
+chmod 0640 "$TLS_CERT" "$TLS_KEY"
 systemctl restart zanoza-panel 2>/dev/null || true
 RENEW
 	chmod 755 /usr/local/bin/zanoza-renew-cert
@@ -301,25 +320,28 @@ case "$cert_choice" in
 		CERT_HOST="$domain"
 		disable_self_signed_renewal
 		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_REF}) для ${domain}..."
-		acme_tarball="/tmp/acme-${ACME_SH_REF}.tar.gz"
+		# Root-owned private temp dir (mode 0700): no predictable, pre-creatable
+		# download/extract paths (V4-01).
+		acme_td="$(mktemp -d)" || die "mktemp не удался"
+		acme_tarball="$acme_td/acme.tar.gz"
 		if curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_REF}.tar.gz" -o "$acme_tarball"; then
 			# Verify the tarball against a pinned checksum when provided (F27).
 			if [ -n "${ACME_SH_SHA256:-}" ]; then
 				got="$(sha256sum "$acme_tarball" | awk '{print $1}')"
-				[ "$got" = "$ACME_SH_SHA256" ] || { rm -f "$acme_tarball"; die "контрольная сумма acme.sh не совпала"; }
+				[ "$got" = "$ACME_SH_SHA256" ] || { rm -rf "$acme_td"; die "контрольная сумма acme.sh не совпала"; }
 			fi
-			tar -xzf "$acme_tarball" -C /tmp
-			( cd "/tmp/acme.sh-${ACME_SH_REF}" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
-			rm -rf "$acme_tarball" "/tmp/acme.sh-${ACME_SH_REF}"
+			tar -xzf "$acme_tarball" -C "$acme_td"
+			( cd "$acme_td/acme.sh-${ACME_SH_REF}" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
 		else
 			warn "не удалось скачать acme.sh ${ACME_SH_REF}; откат на self-signed."
 		fi
+		rm -rf "$acme_td"
 		if [ -x ~/.acme.sh/acme.sh ]; then
 			~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 			if ~/.acme.sh/acme.sh --issue --standalone -d "$domain" >/dev/null 2>&1; then
 				~/.acme.sh/acme.sh --install-cert -d "$domain" \
 					--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
-					--reloadcmd "chown ${SVC_USER}:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null; systemctl restart zanoza-panel" >/dev/null 2>&1
+					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null; systemctl restart zanoza-panel" >/dev/null 2>&1
 			else
 				warn "Let's Encrypt не удался (проверьте A-запись и свободный :80). Откат на self-signed."
 				setup_self_signed "$domain"
@@ -389,11 +411,19 @@ install -m 0755 "$SRC_DIR/scripts/zanoza" "$CLI_BIN"
 mv -f "${PANEL_BIN}.new"  "$PANEL_BIN"
 mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
 
-# Hand ALL runtime state to the unprivileged service user so the panel can run
-# without root (R-09). Binaries stay root-owned + world-executable.
-mkdir -p "$CONFIG_DIR/masterdns"
+# Hand mutable runtime state (config, creds, keyring) to the unprivileged
+# service user so the panel can run without root (R-09). Binaries stay
+# root-owned + world-executable.
+mkdir -p "$CONFIG_DIR/masterdns" "$TLS_DIR"
 chown -R "${SVC_USER}:${SVC_USER}" "$CONFIG_DIR"
 chmod 750 "$CONFIG_DIR"
+# Certificates: the DIRECTORY stays root-owned (service cannot create/symlink
+# inside it) while the files are root-owned + service-group-readable, so the
+# root renewal job writes safely and the service reads via group (V4-01).
+chown -R "root:${SVC_USER}" "$TLS_DIR"
+chmod 0750 "$TLS_DIR"
+[ -f "$TLS_CERT" ] && chmod 0640 "$TLS_CERT"
+[ -f "$TLS_KEY" ]  && chmod 0640 "$TLS_KEY"
 
 # rollback_update restores each replaced artifact from its .bak, or REMOVES it
 # when there was no prior version (a failed fresh install must not leave a

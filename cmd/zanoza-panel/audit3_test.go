@@ -65,3 +65,31 @@ func TestLoadConfigRejectsDuplicateAndEmptyIDs(t *testing.T) {
 		t.Fatal("expected empty-ID config to be rejected")
 	}
 }
+
+// V4-02 — unreadable/malformed credentials must fail closed (no first-run
+// reopen); a genuinely absent file is first-run.
+func TestCredentialsFailClosedOnMalformed(t *testing.T) {
+	dir := t.TempDir()
+
+	// Exists but incomplete (only a username) -> malformed -> fail closed.
+	p := filepath.Join(dir, "panel.env")
+	if err := os.WriteFile(p, []byte("ZANOZA_PANEL_USER='admin'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := loadCredentials(p)
+	if c.loadError() == nil {
+		t.Fatal("malformed creds must set loadError")
+	}
+	if c.setupRequired() {
+		t.Fatal("malformed creds must NOT reopen setup (fail closed)")
+	}
+
+	// Absent file -> genuine first-run.
+	c2 := loadCredentials(filepath.Join(dir, "absent.env"))
+	if c2.loadError() != nil {
+		t.Fatalf("absent file is first-run, not an error: %v", c2.loadError())
+	}
+	if !c2.setupRequired() {
+		t.Fatal("absent creds => setup required")
+	}
+}

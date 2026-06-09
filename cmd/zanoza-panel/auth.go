@@ -36,6 +36,11 @@ type credentials struct {
 	bcryptHash string // preferred
 	legacySalt string // legacy SHA-256 migration only
 	legacyHash string
+
+	// loadErr is set when panel.env exists but could not be read or parsed into
+	// usable credentials. It must make the panel fail closed — never be treated
+	// as a fresh first-run that reopens unauthenticated setup (V4-02).
+	loadErr error
 }
 
 const (
@@ -49,6 +54,11 @@ func loadCredentials(envPath string) *credentials {
 	c := &credentials{envPath: envPath}
 	raw, err := os.ReadFile(envPath)
 	if err != nil {
+		// A genuinely absent file is first-run. ANY other error (permission
+		// denied, I/O) must fail closed, not be mistaken for first-run (V4-02).
+		if !os.IsNotExist(err) {
+			c.loadErr = fmt.Errorf("read %s: %w", envPath, err)
+		}
 		return c
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
@@ -73,7 +83,19 @@ func loadCredentials(envPath string) *credentials {
 			c.legacyHash = val
 		}
 	}
+	// A file that exists but does not parse into a usable credential is treated
+	// as malformed and fails closed (e.g. an interrupted write) (V4-02).
+	if c.user == "" || (c.bcryptHash == "" && c.legacyHash == "") {
+		c.loadErr = fmt.Errorf("%s exists but holds no usable credentials", envPath)
+	}
 	return c
+}
+
+// loadError reports a credential read/parse failure, if any.
+func (c *credentials) loadError() error {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.loadErr
 }
 
 func legacyHashPassword(salt, password string) string {
@@ -84,6 +106,11 @@ func legacyHashPassword(salt, password string) string {
 func (c *credentials) setupRequired() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	// Unreadable/malformed credentials are NOT first-run: fail closed so the
+	// unauthenticated setup endpoint stays disabled (V4-02).
+	if c.loadErr != nil {
+		return false
+	}
 	return c.user == "" || (c.bcryptHash == "" && c.legacyHash == "")
 }
 

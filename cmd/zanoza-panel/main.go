@@ -121,6 +121,11 @@ func main() {
 
 	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
+	// Fail closed: if panel.env exists but is unreadable/malformed, do NOT start
+	// (a transient read error must never reopen unauthenticated setup) (V4-02).
+	if err := creds.loadError(); err != nil {
+		log.Fatalf("credentials: %v (refusing to start; fix or run `zanoza resetcreds`)", err)
+	}
 	maybeAutoSetup(creds)
 	manager := newServerManager(envDefault(EnvRuntimeDir, filepath.Join(configDir, "masterdns")))
 
