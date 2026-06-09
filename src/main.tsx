@@ -218,6 +218,7 @@ function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin
   const [user, setUser] = useState("admin");
   const [password, setPassword] = useState("");
   const [repeat, setRepeat] = useState("");
+  const [token, setToken] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -230,7 +231,7 @@ function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin
       await request(setupRequired ? "api/auth/setup" : "api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user, password }),
+        body: JSON.stringify(setupRequired ? { user, password, token } : { user, password }),
       });
       onLogin();
     } catch (err) {
@@ -281,6 +282,21 @@ function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin
               onChange={(event) => setRepeat(event.target.value)}
               autoComplete="new-password"
             />
+          </label>
+        )}
+        {setupRequired && (
+          <label className="grid gap-2 text-sm text-muted-foreground">
+            Токен первичной настройки
+            <input
+              className="h-10 rounded-md border border-border bg-background px-3 font-mono text-foreground outline-none focus:border-primary"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+              placeholder="из лога сервера / setup.token"
+              autoComplete="off"
+            />
+            <span className="text-xs text-muted-foreground/80">
+              Напечатан в журнале сервера при первом запуске (и в файле {"setup.token"}).
+            </span>
           </label>
         )}
         {error && <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}

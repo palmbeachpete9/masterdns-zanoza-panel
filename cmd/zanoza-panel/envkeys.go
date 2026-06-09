@@ -19,4 +19,10 @@ const (
 	EnvDNSHost     = "ZANOZA_DNS_HOST"
 	EnvDNSPort     = "ZANOZA_DNS_PORT"
 	EnvDNSUpstream = "ZANOZA_DNS_UPSTREAM"
+
+	// EnvExternalOrigin is the externally-visible origin (e.g. behind a
+	// TLS-terminating reverse proxy), like "https://panel.example". When set,
+	// CSRF/origin checks validate against it and cookie Secure is derived from
+	// it instead of the internal listener scheme (V4-03).
+	EnvExternalOrigin = "ZANOZA_EXTERNAL_ORIGIN"
 )

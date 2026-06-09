@@ -180,11 +180,14 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 		return response
 	}
 
-	// Cap cache lifetime by the authoritative record TTL; uncacheable
-	// (no answers / TTL 0) responses are not stored (R-06).
+	// Cap cache lifetime by the authoritative TTL. Positive answers use the
+	// minimum answer TTL; NXDOMAIN/NODATA use the SOA negative TTL; uncacheable
+	// (TTL 0 / no SOA) responses are not stored (R-06/V4-07).
 	var recordTTL time.Duration
 	if ttlSecs, ok := DnsParser.MinAnswerTTL(resolved); ok {
 		recordTTL = time.Duration(ttlSecs) * time.Second
+	} else if negSecs, ok := DnsParser.NegativeTTL(resolved); ok {
+		recordTTL = time.Duration(negSecs) * time.Second
 	}
 	s.dnsCache.SetReady(
 		cacheKey,

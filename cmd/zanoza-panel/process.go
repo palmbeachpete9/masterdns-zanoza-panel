@@ -71,6 +71,18 @@ type serverManager struct {
 	restarts      int       // auto-restarts within the current crash window
 	windowAt      time.Time // start of the current crash-loop window
 	desiredDigest string    // sha256 of the keyring the panel last wrote (R-03)
+	desiredAt     time.Time // when desiredDigest was published (apply timeout, V4-06)
+}
+
+const applyAckTimeout = 15 * time.Second
+
+// recordApplyErr stores an apply-stage failure in runtime state and returns it,
+// so the state endpoint can surface the actual error (V4-06).
+func (m *serverManager) recordApplyErr(err error) error {
+	m.mu.Lock()
+	m.lastApplyErr = err.Error()
+	m.mu.Unlock()
+	return err
 }
 
 const (
@@ -93,7 +105,7 @@ func newServerManager(runtimeDir string) *serverManager {
 // current instances and records the content digest the panel desires (R-03).
 func (m *serverManager) writeKeyring(instances []Instance) error {
 	if err := os.MkdirAll(m.runtimeDir, 0o755); err != nil {
-		return err
+		return m.recordApplyErr(err)
 	}
 	kf := keyringFile{Version: 1}
 	for _, ins := range instances {
@@ -105,20 +117,29 @@ func (m *serverManager) writeKeyring(instances []Instance) error {
 	}
 	raw, err := json.MarshalIndent(kf, "", "  ")
 	if err != nil {
-		return err
+		return m.recordApplyErr(err)
 	}
-	// Desired = digest of the exact bytes we are about to write; the server
-	// writes the same digest to keyring.json.applied after it loads them (R-03).
-	digest := sha256.Sum256(raw)
-	m.mu.Lock()
-	m.desiredDigest = hex.EncodeToString(digest[:])
-	m.mu.Unlock()
+	// digest of the exact bytes we are about to write; the server writes the
+	// same digest to keyring.json.applied after it loads them (R-03).
+	sum := sha256.Sum256(raw)
+	digest := hex.EncodeToString(sum[:])
 	// Atomic write so the server (which may reload concurrently on SIGHUP)
 	// never reads a half-written keyring.json (F04).
 	if err := writeFileAtomic(m.keyringPath, raw, 0o600); err != nil {
-		return err
+		return m.recordApplyErr(err)
 	}
-	return m.ensureServerConfig()
+	if err := m.ensureServerConfig(); err != nil {
+		return m.recordApplyErr(err)
+	}
+	// Publish the desired digest ONLY after the whole durable write transaction
+	// succeeds, so a failed write never advances the reported desired state
+	// (V4-06).
+	m.mu.Lock()
+	m.desiredDigest = digest
+	m.desiredAt = time.Now()
+	m.lastApplyErr = ""
+	m.mu.Unlock()
+	return nil
 }
 
 // ensureServerConfig writes a server_config.toml that points the forked
@@ -364,7 +385,22 @@ func (m *serverManager) state() RuntimeState {
 	applied := readAppliedDigest(m.keyringPath)
 	st.DesiredKeyring = m.desiredDigest
 	st.AppliedKeyring = applied
-	st.ApplyPending = st.Running && (applied == "" || applied != m.desiredDigest)
+	acknowledged := m.desiredDigest != "" && applied == m.desiredDigest
+	st.ApplyPending = st.Running && !acknowledged
+
+	switch {
+	case acknowledged:
+		// The running server confirmed the exact desired keyring: the apply
+		// succeeded, so a stale earlier error is reconciled away (V4-06).
+		m.lastApplyErr = ""
+	case st.ApplyPending && !m.desiredAt.IsZero() && time.Since(m.desiredAt) > applyAckTimeout:
+		// Bounded acknowledgement timeout: pending becomes degraded with a
+		// concrete error rather than hanging "pending" forever (V4-06).
+		if m.lastApplyErr == "" {
+			m.lastApplyErr = "masterdns did not acknowledge the desired keyring within timeout"
+		}
+		st.Status = "degraded"
+	}
 	if m.lastApplyErr != "" {
 		st.ApplyError = m.lastApplyErr
 	}

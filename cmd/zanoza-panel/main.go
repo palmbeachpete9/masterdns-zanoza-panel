@@ -32,14 +32,16 @@ import (
 var embeddedWeb embed.FS
 
 type server struct {
-	cfg      *Config
-	creds    *credentials
-	sessions *sessionStore
-	limiter  *loginLimiter
-	manager  *serverManager
-	assets   map[string]cachedFile
-	useTLS   bool
-	mu       sync.Mutex
+	cfg            *Config
+	creds          *credentials
+	sessions       *sessionStore
+	limiter        *loginLimiter
+	manager        *serverManager
+	assets         map[string]cachedFile
+	setup          *setupGate
+	externalOrigin *url.URL // configured external origin behind a proxy (V4-03)
+	useTLS         bool
+	mu             sync.Mutex
 }
 
 // cachedFile is an embedded static asset preloaded into shared memory once at
@@ -158,14 +160,36 @@ func main() {
 		log.Fatalf("refusing to serve plaintext HTTP on public address %q; configure TLS or set ZANOZA_ALLOW_INSECURE=1", cfg.PanelAddr)
 	}
 
+	// Optional external origin (TLS-terminating reverse proxy) — origin checks
+	// and cookie security derive from it when set (V4-03).
+	var externalOrigin *url.URL
+	if v := os.Getenv(EnvExternalOrigin); v != "" {
+		u, perr := url.Parse(v)
+		if perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			log.Fatalf("invalid %s=%q (want scheme://host[:port])", EnvExternalOrigin, v)
+		}
+		externalOrigin = u
+	}
+
+	// One-time bootstrap token for first-run setup (DNS-rebinding defence, V4-03).
+	setupGate, err := newSetupGate(configDir, creds.setupRequired())
+	if err != nil {
+		log.Fatalf("setup token: %v", err)
+	}
+	if tok := setupGate.logToken(); tok != "" {
+		log.Printf("FIRST-RUN SETUP TOKEN: %s  (also at %s)", tok, filepath.Join(configDir, "setup.token"))
+	}
+
 	srv := &server{
-		cfg:      cfg,
-		creds:    creds,
-		sessions: newSessionStore(),
-		limiter:  newLoginLimiter(8, 5*time.Minute),
-		manager:  manager,
-		assets:   assets,
-		useTLS:   useTLS,
+		cfg:            cfg,
+		creds:          creds,
+		sessions:       newSessionStore(),
+		limiter:        newLoginLimiter(8, 5*time.Minute),
+		manager:        manager,
+		assets:         assets,
+		setup:          setupGate,
+		externalOrigin: externalOrigin,
+		useTLS:         useTLS,
 	}
 
 	// Bring the MasterDnsVPN server up if instances already exist.
@@ -242,7 +266,7 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Content-Security-Policy", "frame-ancestors 'none'")
 	h.Set("Referrer-Policy", "no-referrer")
-	if s.useTLS {
+	if s.cookieSecure() {
 		h.Set("Strict-Transport-Security", "max-age=31536000")
 	}
 
@@ -483,10 +507,27 @@ func (s *server) originMatches(origin, host string) bool {
 	if err != nil || u.Host == "" {
 		return false
 	}
+	// When an external origin is configured (reverse proxy), validate against it
+	// exactly and ignore the (proxy-supplied) Host — supporting HTTPS-terminating
+	// proxies while still defeating rebinding (V4-03).
+	if s.externalOrigin != nil {
+		return strings.EqualFold(u.Scheme, s.externalOrigin.Scheme) &&
+			strings.EqualFold(u.Host, s.externalOrigin.Host)
+	}
 	if !strings.EqualFold(u.Scheme, s.expectedScheme()) {
 		return false
 	}
 	return strings.EqualFold(u.Host, host)
+}
+
+// cookieSecure marks session cookies Secure when the externally-visible origin
+// is HTTPS (e.g. a TLS-terminating proxy), not merely when the internal listener
+// is TLS (V4-03).
+func (s *server) cookieSecure() bool {
+	if s.externalOrigin != nil {
+		return s.externalOrigin.Scheme == "https"
+	}
+	return s.useTLS
 }
 
 func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
@@ -500,7 +541,7 @@ func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
 		Value:    token,
 		Path:     path,
 		HttpOnly: true,
-		Secure:   s.useTLS,
+		Secure:   s.cookieSecure(),
 		SameSite: http.SameSiteLaxMode,
 		MaxAge:   maxAge,
 	})
@@ -530,9 +571,18 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "уже настроено")
 		return
 	}
-	var body struct{ User, Password string }
+	var body struct {
+		User, Password, Token string
+	}
 	if err := readJSON(w, r, &body); err != nil {
 		writeBadBody(w, err)
+		return
+	}
+	// One-time bootstrap token: same-origin alone cannot stop DNS rebinding from
+	// claiming a fresh loopback panel, so a locally-printed token is required and
+	// consumed exactly once (V4-03).
+	if !s.setup.check(body.Token) {
+		writeErr(w, http.StatusForbidden, "invalid or missing setup token")
 		return
 	}
 	// createInitial is the single transactional bootstrap: concurrent setup
@@ -541,6 +591,7 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.setup.consume()
 	token, err := s.sessions.create()
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "session error")

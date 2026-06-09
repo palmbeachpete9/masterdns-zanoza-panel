@@ -10,6 +10,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"strings"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 var (
@@ -361,4 +363,92 @@ func MinAnswerTTL(raw []byte) (uint32, bool) {
 		}
 	}
 	return min, true
+}
+
+// AgeResourceTTLs returns a copy of a DNS response with each answer/authority/
+// additional record's TTL decremented by elapsedSecs (clamped at 0). OPT
+// pseudo-records are never touched (their "TTL" field carries EDNS flags). On
+// any parse/bounds error the input is returned unchanged (fail-safe) (V4-07).
+func AgeResourceTTLs(data []byte, elapsedSecs uint32) []byte {
+	if elapsedSecs == 0 || len(data) < dnsHeaderSize {
+		return data
+	}
+	qd := int(binary.BigEndian.Uint16(data[4:6]))
+	rrCount := int(binary.BigEndian.Uint16(data[6:8])) +
+		int(binary.BigEndian.Uint16(data[8:10])) +
+		int(binary.BigEndian.Uint16(data[10:12]))
+	offset, err := skipQuestions(data, dnsHeaderSize, qd)
+	if err != nil {
+		return data
+	}
+	out := append([]byte(nil), data...)
+	for i := 0; i < rrCount; i++ {
+		nameEnd, err := skipName(data, offset)
+		if err != nil || nameEnd+10 > len(data) {
+			return data
+		}
+		rtype := binary.BigEndian.Uint16(data[nameEnd : nameEnd+2])
+		rdLen := int(binary.BigEndian.Uint16(data[nameEnd+8 : nameEnd+10]))
+		recordEnd := nameEnd + 10 + rdLen
+		if recordEnd > len(data) {
+			return data
+		}
+		if rtype != Enums.DNS_RECORD_TYPE_OPT {
+			ttlOff := nameEnd + 4
+			ttl := binary.BigEndian.Uint32(out[ttlOff : ttlOff+4])
+			if elapsedSecs >= ttl {
+				ttl = 0
+			} else {
+				ttl -= elapsedSecs
+			}
+			binary.BigEndian.PutUint32(out[ttlOff:ttlOff+4], ttl)
+		}
+		offset = recordEnd
+	}
+	return out
+}
+
+// NegativeTTL returns the negative-cache TTL for an NXDOMAIN/NODATA response —
+// min(SOA record TTL, SOA MINIMUM) from the authority section — and whether the
+// response is a cacheable negative answer (V4-07).
+func NegativeTTL(data []byte) (uint32, bool) {
+	if len(data) < dnsHeaderSize {
+		return 0, false
+	}
+	rcode := data[3] & 0x0F
+	an := int(binary.BigEndian.Uint16(data[6:8]))
+	if an != 0 {
+		return 0, false // positive answer; use MinAnswerTTL instead
+	}
+	if rcode != 0 && rcode != 3 { // only NOERROR(NODATA) or NXDOMAIN
+		return 0, false
+	}
+	qd := int(binary.BigEndian.Uint16(data[4:6]))
+	ns := int(binary.BigEndian.Uint16(data[8:10]))
+	offset, err := skipQuestions(data, dnsHeaderSize, qd)
+	if err != nil {
+		return 0, false
+	}
+	for i := 0; i < ns; i++ {
+		nameEnd, err := skipName(data, offset)
+		if err != nil || nameEnd+10 > len(data) {
+			return 0, false
+		}
+		rtype := binary.BigEndian.Uint16(data[nameEnd : nameEnd+2])
+		ttl := binary.BigEndian.Uint32(data[nameEnd+4 : nameEnd+8])
+		rdLen := int(binary.BigEndian.Uint16(data[nameEnd+8 : nameEnd+10]))
+		recordEnd := nameEnd + 10 + rdLen
+		if recordEnd > len(data) {
+			return 0, false
+		}
+		if rtype == Enums.DNS_RECORD_TYPE_SOA && rdLen >= 4 {
+			minimum := binary.BigEndian.Uint32(data[recordEnd-4 : recordEnd])
+			if minimum < ttl {
+				ttl = minimum
+			}
+			return ttl, ttl > 0
+		}
+		offset = recordEnd
+	}
+	return 0, false
 }

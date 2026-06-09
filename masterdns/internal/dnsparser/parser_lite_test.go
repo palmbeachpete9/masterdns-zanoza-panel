@@ -109,3 +109,49 @@ func TestMinAnswerTTL(t *testing.T) {
 		t.Fatal("malformed packet should return ok=false")
 	}
 }
+
+// V4-07 — answer TTLs are aged by elapsed seconds (clamped at 0).
+func TestAgeResourceTTLs(t *testing.T) {
+	pkt := []byte{0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+	pkt = append(pkt, 0x01, 'a', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01)
+	pkt = append(pkt, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x04, 1, 2, 3, 4) // TTL=300
+
+	if ttl, _ := MinAnswerTTL(AgeResourceTTLs(pkt, 100)); ttl != 200 {
+		t.Fatalf("aged TTL = %d, want 200", ttl)
+	}
+	if ttl, _ := MinAnswerTTL(AgeResourceTTLs(pkt, 1000)); ttl != 0 {
+		t.Fatalf("over-aged TTL = %d, want 0 (clamped)", ttl)
+	}
+	if ttl, _ := MinAnswerTTL(AgeResourceTTLs(pkt, 0)); ttl != 300 {
+		t.Fatalf("zero-elapsed must not change TTL, got %d", ttl)
+	}
+	// Malformed input passes through unchanged.
+	if got := AgeResourceTTLs([]byte{0, 0}, 5); len(got) != 2 {
+		t.Fatal("malformed packet should pass through unchanged")
+	}
+}
+
+// V4-07 — NXDOMAIN with an SOA authority record yields min(SOA TTL, SOA MINIMUM).
+func TestNegativeTTL(t *testing.T) {
+	// Header: NXDOMAIN (rcode 3), QD 1, AN 0, NS 1, AR 0.
+	pkt := []byte{0x00, 0x00, 0x81, 0x83, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00}
+	pkt = append(pkt, 0x01, 'a', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01) // question
+	// Authority SOA: name=ptr, type=SOA(6), class=IN, TTL=3600, RDLEN, RDATA.
+	soaRData := []byte{0x00, 0x00}                                                // mname=root, rname=root
+	soaRData = append(soaRData, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1)   // serial/refresh/retry/expire
+	soaRData = append(soaRData, 0x00, 0x00, 0x01, 0x2c)                           // minimum = 300
+	pkt = append(pkt, 0xc0, 0x0c, 0x00, 0x06, 0x00, 0x01, 0x00, 0x00, 0x0e, 0x10) // TTL=3600
+	pkt = append(pkt, byte(len(soaRData)>>8), byte(len(soaRData)))
+	pkt = append(pkt, soaRData...)
+
+	ttl, ok := NegativeTTL(pkt)
+	if !ok || ttl != 300 {
+		t.Fatalf("NegativeTTL = %d,%v; want 300,true (min of TTL 3600 and MINIMUM 300)", ttl, ok)
+	}
+	// A positive response (AN>0) is not a negative cache candidate.
+	pos := append([]byte(nil), pkt...)
+	pos[6], pos[7] = 0, 1 // AN=1
+	if _, ok := NegativeTTL(pos); ok {
+		t.Fatal("positive response must not be negatively cached")
+	}
+}

@@ -112,11 +112,16 @@ func TestLoadConfigRejectsCanonicalCollision(t *testing.T) {
 
 func newTestServer(t *testing.T) *server {
 	t.Helper()
+	gate, err := newSetupGate(t.TempDir(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
 	return &server{
 		cfg:      defaultConfig(),
 		creds:    loadCredentials(filepath.Join(t.TempDir(), "panel.env")),
 		sessions: newSessionStore(),
 		limiter:  newLoginLimiter(8, time.Minute),
+		setup:    gate,
 	}
 }
 

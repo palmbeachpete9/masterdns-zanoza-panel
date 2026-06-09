@@ -20,6 +20,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	DnsParser "masterdnsvpn-go/internal/dnsparser"
 )
 
 type Status uint8
@@ -127,6 +129,17 @@ func getShardIndex(key string) int {
 	return int(h.Sum32() & shardMask)
 }
 
+// agedResponse ages the cached record TTLs by the time elapsed since insertion
+// (so a downstream resolver is never told a fuller TTL than remains) and then
+// patches the transaction ID / flags for the current query (V4-07).
+func (s *Store) agedResponse(entry *Entry, rawQuery []byte, now time.Time) []byte {
+	resp := entry.Response
+	if elapsed := now.Sub(entry.CreatedAt); elapsed >= time.Second {
+		resp = DnsParser.AgeResourceTTLs(resp, uint32(elapsed/time.Second))
+	}
+	return PatchResponseForQuery(resp, rawQuery)
+}
+
 func PatchResponseForQuery(rawResponse, rawQuery []byte) []byte {
 	if len(rawResponse) < 2 {
 		return rawResponse
@@ -166,7 +179,7 @@ func (s *Store) LookupOrCreatePending(key, domain string, qType, qClass uint16, 
 				shard.order.MoveToBack(element)
 				return LookupResult{
 					Status:   StatusReady,
-					Response: PatchResponseForQuery(node.entry.Response, nil),
+					Response: s.agedResponse(&node.entry, nil, now),
 				}
 			}
 			if now.Sub(node.entry.LastDispatchAt) >= s.pendingTimeout {
@@ -234,7 +247,7 @@ func (s *Store) GetReady(key string, rawQuery []byte, now time.Time) ([]byte, bo
 
 	s.touchEntryLocked(shard, &node.entry, now)
 	shard.order.MoveToBack(element)
-	return PatchResponseForQuery(node.entry.Response, rawQuery), true
+	return s.agedResponse(&node.entry, rawQuery, now), true
 }
 
 // SetReady caches a ready response. recordTTL is the authoritative TTL from the
