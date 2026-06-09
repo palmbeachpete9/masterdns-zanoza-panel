@@ -822,11 +822,12 @@ func NewClientConfigFlagBinder(fs *flag.FlagSet) (*ClientConfigFlagBinder, error
 }
 
 func (b *ClientConfigFlagBinder) Overrides() ClientConfigOverrides {
+	// Nil check BEFORE any receiver dereference (R-10).
+	if b == nil {
+		return ClientConfigOverrides{Values: map[string]any{}}
+	}
 	overrides := ClientConfigOverrides{
 		Values: make(map[string]any, len(b.setFields)),
-	}
-	if b == nil {
-		return overrides
 	}
 
 	valueElem := reflect.ValueOf(&b.values).Elem()

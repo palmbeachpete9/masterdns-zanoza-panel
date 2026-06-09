@@ -63,3 +63,36 @@ func TestStoreByteAccountingOnReplaceAndPurge(t *testing.T) {
 		t.Fatalf("after purge retained %d bytes, want 0", got)
 	}
 }
+
+// R-04 — a single-fragment completion on a key that has a partial multi-fragment
+// entry must return that entry's bytes to the budget (no leak).
+func TestSingleFragmentCompletionReturnsBytes(t *testing.T) {
+	s := New[int](16)
+	now := time.Now()
+	s.Collect(1, []byte("12345678"), 0, 2, now, time.Minute) // partial, 8 bytes
+	s.mu.Lock()
+	b := s.bytes
+	s.mu.Unlock()
+	if b != 8 {
+		t.Fatalf("partial bytes = %d, want 8", b)
+	}
+	s.Collect(1, []byte("x"), 0, 1, now, time.Minute) // single-fragment completion, same key
+	s.mu.Lock()
+	b = s.bytes
+	s.mu.Unlock()
+	if b != 0 {
+		t.Fatalf("byte budget leaked after single-fragment completion: %d, want 0 (R-04)", b)
+	}
+
+	// Repeat many times: the budget must not accumulate a leak.
+	for i := 0; i < 50000; i++ {
+		s.Collect(2, make([]byte, 200), 0, 2, now, time.Minute)
+		s.Collect(2, []byte("x"), 0, 1, now, time.Minute)
+	}
+	s.mu.Lock()
+	b = s.bytes
+	s.mu.Unlock()
+	if b != 0 {
+		t.Fatalf("accumulated byte leak: %d, want 0 (R-04)", b)
+	}
+}

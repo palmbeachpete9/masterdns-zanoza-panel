@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -24,9 +26,8 @@ type keyringEntry struct {
 }
 
 type keyringFile struct {
-	Version    int            `json:"version"`
-	Generation uint64         `json:"generation,omitempty"`
-	Instances  []keyringEntry `json:"instances"`
+	Version   int            `json:"version"`
+	Instances []keyringEntry `json:"instances"`
 }
 
 // RuntimeState is reported to the UI.
@@ -38,12 +39,14 @@ type RuntimeState struct {
 	StartedAt   string `json:"started_at,omitempty"`
 	ExitedAt    string `json:"exited_at,omitempty"`
 	ExitError   string `json:"exit_error,omitempty"`
-	// Generation tracking (F04): DesiredGeneration is the keyring the panel last
-	// pushed; AppliedGeneration is the generation the running server has
-	// acknowledged loading. ApplyPending is true when they differ.
-	DesiredGeneration uint64 `json:"desired_generation"`
-	AppliedGeneration uint64 `json:"applied_generation"`
-	ApplyPending      bool   `json:"apply_pending"`
+	// Content-bound apply tracking (R-03): DesiredKeyring is the digest of the
+	// keyring the panel last wrote; AppliedKeyring is the digest the running
+	// server acknowledged loading. ApplyPending is true when the running server
+	// has not (yet) acknowledged the exact desired keyring.
+	DesiredKeyring string `json:"desired_keyring,omitempty"`
+	AppliedKeyring string `json:"applied_keyring,omitempty"`
+	ApplyPending   bool   `json:"apply_pending"`
+	ApplyError     string `json:"apply_error,omitempty"`
 }
 
 // serverManager supervises the single MasterDnsVPN server process and keeps
@@ -64,10 +67,10 @@ type serverManager struct {
 	exitErr      string
 	lastApplyErr string
 
-	desiredUp  bool      // operator intent: should the server be running?
-	restarts   int       // auto-restarts within the current crash window
-	windowAt   time.Time // start of the current crash-loop window
-	desiredGen uint64    // last keyring generation written by the panel (F04)
+	desiredUp     bool      // operator intent: should the server be running?
+	restarts      int       // auto-restarts within the current crash window
+	windowAt      time.Time // start of the current crash-loop window
+	desiredDigest string    // sha256 of the keyring the panel last wrote (R-03)
 }
 
 const (
@@ -86,16 +89,13 @@ func newServerManager(runtimeDir string) *serverManager {
 	}
 }
 
-// writeKeyring renders keyring.json (stamped with the desired generation) + a
-// base server_config.toml from the current instances.
-func (m *serverManager) writeKeyring(instances []Instance, gen uint64) error {
+// writeKeyring renders keyring.json + a base server_config.toml from the
+// current instances and records the content digest the panel desires (R-03).
+func (m *serverManager) writeKeyring(instances []Instance) error {
 	if err := os.MkdirAll(m.runtimeDir, 0o755); err != nil {
 		return err
 	}
-	m.mu.Lock()
-	m.desiredGen = gen
-	m.mu.Unlock()
-	kf := keyringFile{Version: 1, Generation: gen}
+	kf := keyringFile{Version: 1}
 	for _, ins := range instances {
 		kf.Instances = append(kf.Instances, keyringEntry{
 			Domain: ins.Domain,
@@ -107,6 +107,12 @@ func (m *serverManager) writeKeyring(instances []Instance, gen uint64) error {
 	if err != nil {
 		return err
 	}
+	// Desired = digest of the exact bytes we are about to write; the server
+	// writes the same digest to keyring.json.applied after it loads them (R-03).
+	digest := sha256.Sum256(raw)
+	m.mu.Lock()
+	m.desiredDigest = hex.EncodeToString(digest[:])
+	m.mu.Unlock()
 	// Atomic write so the server (which may reload concurrently on SIGHUP)
 	// never reads a half-written keyring.json (F04).
 	if err := writeFileAtomic(m.keyringPath, raw, 0o600); err != nil {
@@ -158,11 +164,11 @@ LOG_LEVEL = "INFO"
 // apply renders the keyring then reloads or (re)starts the server. The whole
 // pipeline is serialized under applyMu so concurrent CRUD can never interleave
 // renders/reloads, and signal/start failures are returned to the caller (F04).
-func (m *serverManager) apply(instances []Instance, gen uint64) error {
+func (m *serverManager) apply(instances []Instance) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 
-	if err := m.writeKeyring(instances, gen); err != nil {
+	if err := m.writeKeyring(instances); err != nil {
 		return err
 	}
 
@@ -318,14 +324,14 @@ func (m *serverManager) stop() {
 	}
 }
 
-func (m *serverManager) restart(instances []Instance, gen uint64) error {
+func (m *serverManager) restart(instances []Instance) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
 	m.stop()
 	if len(instances) == 0 {
 		return nil
 	}
-	if err := m.writeKeyring(instances, gen); err != nil {
+	if err := m.writeKeyring(instances); err != nil {
 		return err
 	}
 	return m.start()
@@ -352,26 +358,28 @@ func (m *serverManager) state() RuntimeState {
 			st.ExitedAt = m.exitedAt.UTC().Format(time.RFC3339)
 		}
 	}
-	// Desired vs applied generation (F04): the panel knows what it wrote; the
-	// running server records what it actually loaded in keyring.json.applied.
-	st.DesiredGeneration = m.desiredGen
-	st.AppliedGeneration = readAppliedGeneration(m.keyringPath)
-	st.ApplyPending = st.Running && st.AppliedGeneration != st.DesiredGeneration
+	// Content-bound desired vs applied (R-03): the panel knows the digest it
+	// wrote; the running server records the digest it actually loaded. A missing
+	// or mismatched marker is treated as NOT applied (never as a false success).
+	applied := readAppliedDigest(m.keyringPath)
+	st.DesiredKeyring = m.desiredDigest
+	st.AppliedKeyring = applied
+	st.ApplyPending = st.Running && (applied == "" || applied != m.desiredDigest)
+	if m.lastApplyErr != "" {
+		st.ApplyError = m.lastApplyErr
+	}
 	return st
 }
 
-// readAppliedGeneration reads the generation the MasterDNS server acknowledged
-// loading (written next to keyring.json). Returns 0 if absent/unreadable (F04).
-func readAppliedGeneration(keyringPath string) uint64 {
+// readAppliedDigest reads the content digest the MasterDNS server acknowledged
+// loading (written next to keyring.json). Returns "" (unacknowledged) if the
+// marker is absent or unreadable — never a value that could look applied (R-03).
+func readAppliedDigest(keyringPath string) string {
 	raw, err := os.ReadFile(keyringPath + ".applied")
 	if err != nil {
-		return 0
+		return ""
 	}
-	n, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
-	if err != nil {
-		return 0
-	}
-	return n
+	return strings.TrimSpace(string(raw))
 }
 
 // processMemoryBytes reads RSS from /proc on Linux; best-effort elsewhere.

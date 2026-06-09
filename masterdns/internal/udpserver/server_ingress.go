@@ -97,9 +97,9 @@ func (s *Server) ReloadKeyring(path string) error {
 		id:       s.ingressID.Add(1),
 	}
 	s.ingress.Store(next)
-	// Acknowledge the applied generation so the panel can confirm the running
-	// server matches the desired keyring (F04).
-	if err := keyring.WriteApplied(path, resolver.Generation()); err != nil {
+	// Acknowledge the applied content digest so the panel can confirm the
+	// running server matches the exact desired keyring (R-03).
+	if err := keyring.WriteApplied(path, resolver.Digest()); err != nil {
 		return err
 	}
 	return nil

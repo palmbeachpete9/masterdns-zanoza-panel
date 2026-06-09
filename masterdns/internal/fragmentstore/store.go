@@ -92,7 +92,10 @@ func (s *Store[K]) Collect(key K, payload []byte, fragmentID, totalFragments uin
 			return nil, false, true
 		}
 
-		delete(s.items, key)
+		// Use the byte-aware delete: a single-fragment completion can land on a
+		// key that already has a partial multi-fragment entry, whose retained
+		// bytes must be returned to the budget (R-04).
+		s.deleteItemLocked(key)
 		if _, exists := s.completed[key]; !exists && len(s.completed) >= s.maxCompleted {
 			s.evictOldestCompletedLocked()
 		}

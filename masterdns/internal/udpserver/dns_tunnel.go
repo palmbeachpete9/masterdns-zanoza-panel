@@ -180,12 +180,19 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 		return response
 	}
 
+	// Cap cache lifetime by the authoritative record TTL; uncacheable
+	// (no answers / TTL 0) responses are not stored (R-06).
+	var recordTTL time.Duration
+	if ttlSecs, ok := DnsParser.MinAnswerTTL(resolved); ok {
+		recordTTL = time.Duration(ttlSecs) * time.Second
+	}
 	s.dnsCache.SetReady(
 		cacheKey,
 		parsed.FirstQuestion.Name,
 		parsed.FirstQuestion.Type,
 		parsed.FirstQuestion.Class,
 		resolved,
+		recordTTL,
 		now,
 	)
 	if s.log != nil {

@@ -48,6 +48,10 @@ type RuntimeState = {
   started_at?: string;
   exited_at?: string;
   exit_error?: string;
+  desired_keyring?: string;
+  applied_keyring?: string;
+  apply_pending?: boolean;
+  apply_error?: string;
 };
 
 type State = {
@@ -624,8 +628,16 @@ function App() {
             icon={<Activity className="h-4 w-4" />}
             label="Сервер"
             value={
-              <span className={state?.server.running ? "text-primary" : "text-destructive"}>
-                {state?.server.running ? "Running" : "Stopped"}
+              <span className="flex flex-col">
+                <span className={state?.server.running ? "text-primary" : "text-destructive"}>
+                  {state?.server.running ? "Running" : "Stopped"}
+                </span>
+                {state?.server.apply_pending && (
+                  <span className="text-xs font-normal text-yellow-500">Применение…</span>
+                )}
+                {state?.server.apply_error && (
+                  <span className="text-xs font-normal text-destructive">{state.server.apply_error}</span>
+                )}
               </span>
             }
           />

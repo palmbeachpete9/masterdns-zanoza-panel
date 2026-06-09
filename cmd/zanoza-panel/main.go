@@ -108,7 +108,7 @@ func main() {
 
 	// Bring the MasterDnsVPN server up if instances already exist.
 	if len(cfg.snapshot()) > 0 {
-		if err := manager.apply(cfg.snapshot(), cfg.Generation()); err != nil {
+		if err := manager.apply(cfg.snapshot()); err != nil {
 			log.Printf("masterdns start: %v", err)
 		}
 	}
@@ -124,7 +124,7 @@ func main() {
 				// interleave with an HTTP mutation, and s.cfg identity stays
 				// stable (no stale-pointer handler) (F13).
 				srv.config().publishReload(reloaded)
-				_ = manager.apply(srv.config().snapshot(), srv.config().Generation())
+				_ = manager.apply(srv.config().snapshot())
 				log.Printf("reloaded config")
 			}
 		}
@@ -184,9 +184,9 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 		h.Set("Strict-Transport-Security", "max-age=31536000")
 	}
 
-	s.mu.Lock()
-	path := s.cfg.PanelPath
-	s.mu.Unlock()
+	// Read PanelPath through the config lock (cfg.Meta), not s.mu, since
+	// publishReload mutates it under cfg.mu — reading under s.mu was a race (R-01).
+	path := s.config().Meta().PanelPath
 
 	if r.URL.Path == "/-/reload" && r.Method == http.MethodPost {
 		s.requireAuth(w, r, s.handleReload)
@@ -358,7 +358,7 @@ func (s *server) requireAuth(w http.ResponseWriter, r *http.Request, next http.H
 		return
 	}
 	// CSRF defence: reject cross-origin state-changing requests (N04).
-	if isMutatingMethod(r.Method) && !sameOriginOK(r) {
+	if isMutatingMethod(r.Method) && !s.sameOriginOK(r) {
 		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
@@ -373,25 +373,59 @@ func isMutatingMethod(m string) bool {
 	return false
 }
 
-// sameOriginOK accepts a request when it carries no Origin (non-browser client)
-// or an Origin whose host:port matches the request Host. Browsers always send
-// Origin on cross-origin requests, so a mismatch is a CSRF attempt (N04).
-func sameOriginOK(r *http.Request) bool {
+// expectedScheme is derived from the actual TLS listener, never from untrusted
+// forwarding headers (R-02).
+func (s *server) expectedScheme() string {
+	if s.useTLS {
+		return "https"
+	}
+	return "http"
+}
+
+// sameOriginOK accepts a request that carries no Origin (non-browser client) or
+// an Origin whose scheme, host and port exactly match the panel's own. Browsers
+// always send Origin on cross-origin requests, so a mismatch is a CSRF attempt.
+// The scheme is now compared too (R-02/N04).
+func (s *server) sameOriginOK(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return true
 	}
+	return s.originMatches(origin, r.Host)
+}
+
+// strictSameOrigin additionally REQUIRES the Origin header to be present and
+// matching — used for unauthenticated first-run setup, where a missing/mismatched
+// browser origin must be rejected (R-02).
+func (s *server) strictSameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	return s.originMatches(origin, r.Host)
+}
+
+func hasJSONContentType(r *http.Request) bool {
+	ct := r.Header.Get("Content-Type")
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "application/json")
+}
+
+func (s *server) originMatches(origin, host string) bool {
 	u, err := url.Parse(origin)
 	if err != nil || u.Host == "" {
 		return false
 	}
-	return strings.EqualFold(u.Host, r.Host)
+	if !strings.EqualFold(u.Scheme, s.expectedScheme()) {
+		return false
+	}
+	return strings.EqualFold(u.Host, host)
 }
 
 func (s *server) setSessionCookie(w http.ResponseWriter, token string) {
-	s.mu.Lock()
-	path := s.cfg.PanelPath
-	s.mu.Unlock()
+	path := s.config().Meta().PanelPath // cfg.mu-protected read (R-01)
 	maxAge := 12 * 3600
 	if token == "" {
 		maxAge = -1 // expire immediately on logout
@@ -417,6 +451,14 @@ func (s *server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// First-run setup is unauthenticated, so CSRF protection must be applied
+	// here directly (it does not pass through requireAuth): require an exact
+	// same-origin browser request, and a JSON content type to force a CORS
+	// preflight for cross-origin attempts (R-02).
+	if !s.strictSameOrigin(r) || !hasJSONContentType(r) {
+		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
 	if !s.creds.setupRequired() {
@@ -446,6 +488,10 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.sameOriginOK(r) {
+		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
 	limitKey := clientIP(r)
@@ -680,7 +726,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if err := s.manager.restart(s.config().snapshot(), s.config().Generation()); err != nil {
+	if err := s.manager.restart(s.config().snapshot()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -688,7 +734,7 @@ func (s *server) handleServerRestart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) handleReload(w http.ResponseWriter, _ *http.Request) {
-	if err := s.manager.apply(s.config().snapshot(), s.config().Generation()); err != nil {
+	if err := s.manager.apply(s.config().snapshot()); err != nil {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -707,7 +753,9 @@ func (s *server) mutateInstances(fn func([]Instance) ([]Instance, error)) error 
 			return err
 		}
 		work.Instances = next
-		return nil
+		// Validate the complete proposed list (IDs, canonical domains, multi-key
+		// rules) inside the transaction before it is persisted (R-05).
+		return work.canonicalizeAndValidateInstances()
 	}); err != nil {
 		return err
 	}
@@ -715,7 +763,7 @@ func (s *server) mutateInstances(fn func([]Instance) ([]Instance, error)) error 
 	// (re)start/reload the MasterDnsVPN server (e.g. binary missing on a dev
 	// box) must NOT roll back the CRUD operation — it surfaces separately via
 	// state.server.exit_error / apply_error.
-	if err := s.manager.apply(cfg.snapshot(), cfg.Generation()); err != nil {
+	if err := s.manager.apply(cfg.snapshot()); err != nil {
 		log.Printf("masterdns apply: %v", err)
 	}
 	return nil

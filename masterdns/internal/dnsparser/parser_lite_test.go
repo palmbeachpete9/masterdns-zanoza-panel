@@ -93,3 +93,19 @@ func buildMultiQuestionDNSQuery(id uint16, questions []liteQuestionSpec, withOPT
 	copy(packet[offset:], opt)
 	return packet
 }
+
+// R-06 — MinAnswerTTL returns the smallest answer TTL.
+func TestMinAnswerTTL(t *testing.T) {
+	// Header: ID 0, flags 0x8180, QD 1, AN 1.
+	pkt := []byte{0x00, 0x00, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+	pkt = append(pkt, 0x01, 'a', 0x03, 'c', 'o', 'm', 0x00, 0x00, 0x01, 0x00, 0x01) // question a.com A IN
+	// Answer: name ptr 0xc00c, A, IN, TTL=300, RDLEN 4, 1.2.3.4
+	pkt = append(pkt, 0xc0, 0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x01, 0x2c, 0x00, 0x04, 1, 2, 3, 4)
+	ttl, ok := MinAnswerTTL(pkt)
+	if !ok || ttl != 300 {
+		t.Fatalf("MinAnswerTTL = %d,%v; want 300,true", ttl, ok)
+	}
+	if _, ok := MinAnswerTTL([]byte{0, 0}); ok {
+		t.Fatal("malformed packet should return ok=false")
+	}
+}

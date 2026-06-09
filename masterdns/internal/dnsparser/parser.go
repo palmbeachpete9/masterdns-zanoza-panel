@@ -345,3 +345,20 @@ func writeLowerASCIILabel(dst *strings.Builder, label []byte) {
 		}
 	}
 }
+
+// MinAnswerTTL returns the smallest TTL across the answer records of a DNS
+// response, and whether at least one answer record was present. It is used to
+// cap cache lifetime by the authoritative TTL (R-06).
+func MinAnswerTTL(raw []byte) (uint32, bool) {
+	pkt, err := ParsePacket(raw)
+	if err != nil || len(pkt.Answers) == 0 {
+		return 0, false
+	}
+	min := pkt.Answers[0].TTL
+	for _, rr := range pkt.Answers[1:] {
+		if rr.TTL < min {
+			min = rr.TTL
+		}
+	}
+	return min, true
+}

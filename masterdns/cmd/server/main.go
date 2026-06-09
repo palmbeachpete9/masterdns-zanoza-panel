@@ -168,9 +168,9 @@ func main() {
 	srv := UDPServer.New(cfg, log, codec)
 	if keyResolver != nil {
 		srv.SetKeyResolver(keyResolver)
-		// Acknowledge the initially-loaded generation (F04).
+		// Acknowledge the initially-loaded content digest (R-03).
 		if keyringPath != "" {
-			if err := keyring.WriteApplied(keyringPath, keyResolver.Generation()); err != nil {
+			if err := keyring.WriteApplied(keyringPath, keyResolver.Digest()); err != nil {
 				log.Errorf("❌ <red>Keyring Applied-Marker Write Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
 			}
 		}

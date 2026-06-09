@@ -44,3 +44,22 @@ func TestBuildKeyFromQueryShape(t *testing.T) {
 		t.Fatal("identical queries must share a key")
 	}
 }
+
+// R-06 — cache expiry is capped by the authoritative record TTL, and zero-TTL
+// responses are not cached.
+func TestSetReadyCapsByRecordTTL(t *testing.T) {
+	s := New(16, time.Hour, time.Second) // configured cache TTL = 1h
+	t0 := time.Now()
+	s.SetReady("k", "example.com", 1, 1, []byte("\x00\x00resp"), 1*time.Second, t0)
+	if _, ok := s.GetReady("k", nil, t0.Add(500*time.Millisecond)); !ok {
+		t.Fatal("response should be present at 0.5s")
+	}
+	if _, ok := s.GetReady("k", nil, t0.Add(2*time.Second)); ok {
+		t.Fatal("response must expire at 2s despite the 1h cache TTL (R-06)")
+	}
+
+	s.SetReady("k2", "example.com", 1, 1, []byte("\x00\x00resp"), 0, t0)
+	if _, ok := s.GetReady("k2", nil, t0); ok {
+		t.Fatal("zero-TTL response must not be cached (R-06)")
+	}
+}

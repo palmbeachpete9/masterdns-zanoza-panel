@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,30 +11,41 @@ import (
 	"time"
 )
 
-// F04 — the keyring is stamped with the desired generation, and state() reports
-// desired vs applied (with apply_pending) from the server's applied marker.
-func TestKeyringGenerationAck(t *testing.T) {
+// R-03/F04 — the apply ACK is bound to a content digest: a missing or mismatched
+// marker reads as unacknowledged (never a false success / generation zero), and a
+// matching digest clears pending.
+func TestKeyringDigestAck(t *testing.T) {
 	m := newServerManager(t.TempDir())
-	if err := m.writeKeyring([]Instance{{Domain: "v.example.com", Key: "k", Method: 5}}, 7); err != nil {
+	if err := m.writeKeyring([]Instance{{Domain: "v.example.com", Key: "k", Method: 5}}); err != nil {
 		t.Fatal(err)
 	}
 	raw, _ := os.ReadFile(m.keyringPath)
-	var kf keyringFile
-	if err := json.Unmarshal(raw, &kf); err != nil || kf.Generation != 7 {
-		t.Fatalf("generation not stamped into keyring.json: gen=%d err=%v", kf.Generation, err)
+	want := sha256.Sum256(raw)
+	wantHex := hex.EncodeToString(want[:])
+	if m.desiredDigest != wantHex {
+		t.Fatalf("desired digest mismatch: %q vs %q", m.desiredDigest, wantHex)
 	}
-	if got := readAppliedGeneration(m.keyringPath); got != 0 {
-		t.Fatalf("applied generation should be 0 before ACK, got %d", got)
+
+	// No marker yet -> unacknowledged.
+	if got := readAppliedDigest(m.keyringPath); got != "" {
+		t.Fatalf("applied digest should be empty before ACK, got %q", got)
 	}
-	if err := os.WriteFile(m.keyringPath+".applied", []byte("7\n"), 0o600); err != nil {
+
+	// A STALE marker (different content) must NOT look applied (no replay).
+	if err := os.WriteFile(m.keyringPath+".applied", []byte("deadbeef\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := readAppliedGeneration(m.keyringPath); got != 7 {
-		t.Fatalf("applied generation = %d, want 7", got)
+	if got := readAppliedDigest(m.keyringPath); got == wantHex {
+		t.Fatal("stale digest must not match desired")
+	}
+
+	// Matching marker -> acknowledged.
+	if err := os.WriteFile(m.keyringPath+".applied", []byte(wantHex+"\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
 	st := m.state()
-	if st.DesiredGeneration != 7 {
-		t.Fatalf("desired generation = %d, want 7", st.DesiredGeneration)
+	if st.DesiredKeyring != wantHex || st.AppliedKeyring != wantHex {
+		t.Fatalf("state digests mismatch: desired=%q applied=%q", st.DesiredKeyring, st.AppliedKeyring)
 	}
 }
 

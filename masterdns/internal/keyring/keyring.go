@@ -13,6 +13,8 @@
 package keyring
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,7 +34,7 @@ type Entry struct {
 
 type keyringFile struct {
 	Version    int     `json:"version"`
-	Generation uint64  `json:"generation,omitempty"`
+	Generation uint64  `json:"generation,omitempty"` // informational only; ACK is content-based
 	Instances  []Entry `json:"instances"`
 }
 
@@ -46,23 +48,35 @@ type ring struct {
 
 // Resolver maps normalized domain -> ring.
 type Resolver struct {
-	rings      map[string]*ring
-	domains    []string
-	generation uint64
+	rings   map[string]*ring
+	domains []string
+	digest  string // sha256 of the exact keyring.json content loaded
 }
 
-// Generation returns the panel-assigned generation of this keyring (F04).
-func (r *Resolver) Generation() uint64 {
+// Digest returns the content digest of the loaded keyring. The acknowledgement
+// is bound to content, not a reusable counter, so a stale marker can never be
+// replayed or mistaken for a new configuration after a restart (R-03/F04).
+func (r *Resolver) Digest() string {
 	if r == nil {
-		return 0
+		return ""
 	}
-	return r.generation
+	return r.digest
 }
 
-// WriteApplied records the generation the server has actually loaded, next to
-// the keyring file, so the panel can confirm desired vs applied state (F04).
-func WriteApplied(keyringPath string, generation uint64) error {
-	return os.WriteFile(keyringPath+".applied", []byte(fmt.Sprintf("%d\n", generation)), 0o600)
+// DigestOf returns the canonical content digest for keyring bytes.
+func DigestOf(raw []byte) string {
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:])
+}
+
+// WriteApplied atomically records the digest the server actually loaded, next
+// to the keyring file, so the panel can confirm desired vs applied state (R-03).
+func WriteApplied(keyringPath, digest string) error {
+	tmp := keyringPath + ".applied.tmp"
+	if err := os.WriteFile(tmp, []byte(digest+"\n"), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, keyringPath+".applied")
 }
 
 func normalizeDomain(domain string) string {
@@ -83,7 +97,7 @@ func Load(path string) (*Resolver, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.generation = kf.Generation
+	r.digest = DigestOf(raw)
 	return r, nil
 }
 

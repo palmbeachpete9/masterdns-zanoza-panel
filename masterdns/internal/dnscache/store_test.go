@@ -21,8 +21,8 @@ func TestStore_BinaryPersistence(t *testing.T) {
 		BuildKey("github.com", 1, 1),
 	}
 
-	s.SetReady(keys[0], "example.com", 1, 1, []byte("\x00\x00answer1"), now)
-	s.SetReady(keys[1], "google.com", 28, 1, []byte("\x00\x00answer2"), now)
+	s.SetReady(keys[0], "example.com", 1, 1, []byte("\x00\x00answer1"), time.Hour, now)
+	s.SetReady(keys[1], "google.com", 28, 1, []byte("\x00\x00answer2"), time.Hour, now)
 	s.LookupOrCreatePending(keys[2], "github.com", 1, 1, now)
 
 	// Save to file
@@ -78,7 +78,7 @@ func TestStore_Sharding(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		domain := "domain" + string(rune(i))
 		key := BuildKey(domain, 1, 1)
-		s.SetReady(key, domain, 1, 1, []byte("\x00\x00resp"), now)
+		s.SetReady(key, domain, 1, 1, []byte("\x00\x00resp"), time.Hour, now)
 	}
 
 	// Verify we didn't exceed a reasonable total (accounting for shard distribution)
@@ -102,7 +102,7 @@ func TestStoreLoadFromFileFailsOnCorruptEntry(t *testing.T) {
 	s := New(100, time.Hour, time.Minute)
 	now := time.Now()
 	key := BuildKey("example.com", 1, 1)
-	s.SetReady(key, "example.com", 1, 1, []byte("\x00\x00answer1"), now)
+	s.SetReady(key, "example.com", 1, 1, []byte("\x00\x00answer1"), time.Hour, now)
 
 	if _, err := s.SaveToFile(cachePath, now); err != nil {
 		t.Fatalf("SaveToFile failed: %v", err)

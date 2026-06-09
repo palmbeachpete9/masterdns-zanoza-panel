@@ -42,7 +42,10 @@ type Entry struct {
 	CreatedAt      time.Time
 	LastUsedAt     time.Time
 	LastDispatchAt time.Time
-	Response       []byte
+	// ExpiresAt is the absolute expiry, capped by the authoritative record TTL
+	// at insertion (R-06). Zero means "fall back to CreatedAt+cacheTTL".
+	ExpiresAt time.Time
+	Response  []byte
 }
 
 type LookupResult struct {
@@ -234,7 +237,11 @@ func (s *Store) GetReady(key string, rawQuery []byte, now time.Time) ([]byte, bo
 	return PatchResponseForQuery(node.entry.Response, rawQuery), true
 }
 
-func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse []byte, now time.Time) {
+// SetReady caches a ready response. recordTTL is the authoritative TTL from the
+// response (e.g. min answer TTL). A non-positive recordTTL is NOT cached and any
+// stale entry is dropped; otherwise expiry is capped at min(cacheTTL, recordTTL)
+// so the cache never serves a record past its authoritative lifetime (R-06).
+func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse []byte, recordTTL time.Duration, now time.Time) {
 	if s == nil || key == "" || len(rawResponse) < 2 {
 		return
 	}
@@ -244,6 +251,19 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
+
+	// Do not cache zero/negative-TTL responses; invalidate any stale entry (R-06).
+	if recordTTL <= 0 {
+		if element, ok := shard.items[key]; ok {
+			s.removeElementLocked(shard, element)
+		}
+		return
+	}
+	effective := recordTTL
+	if effective > s.cacheTTL {
+		effective = s.cacheTTL
+	}
+	expiresAt := now.Add(effective)
 
 	normalized := make([]byte, len(rawResponse))
 	copy(normalized, rawResponse)
@@ -260,10 +280,9 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 		node.entry.QuestionType = qType
 		node.entry.QuestionClass = qClass
 		node.entry.Status = StatusReady
-		// A (re)resolved response resets the absolute TTL clock; CreatedAt is
-		// the insertion time and is never advanced by a cache hit (N02).
 		node.entry.CreatedAt = now
 		node.entry.LastUsedAt = now
+		node.entry.ExpiresAt = expiresAt
 		node.entry.Response = normalized
 		s.dirty.Add(1)
 		shard.order.MoveToBack(element)
@@ -277,6 +296,7 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 		Status:        StatusReady,
 		CreatedAt:     now,
 		LastUsedAt:    now,
+		ExpiresAt:     expiresAt,
 		Response:      normalized,
 	}
 	element := shard.order.PushBack(&cacheNode{key: key, entry: entry})
@@ -342,9 +362,11 @@ func (s *Store) isExpired(entry *Entry, now time.Time) bool {
 	if entry.Status == StatusPending {
 		return false
 	}
-	// Absolute TTL from insertion (N02): a frequently-hit entry must still
-	// expire so stale records cannot live forever. LastUsedAt is for LRU
-	// eviction ordering only.
+	// Prefer the absolute expiry capped by the authoritative record TTL (R-06);
+	// fall back to CreatedAt+cacheTTL for entries without it (older format / N02).
+	if !entry.ExpiresAt.IsZero() {
+		return !now.Before(entry.ExpiresAt)
+	}
 	return now.Sub(entry.CreatedAt) >= s.cacheTTL
 }
 
@@ -379,7 +401,7 @@ func (s *Store) removeElementLocked(shard *shard, element *list.Element) {
 
 const (
 	binaryMagic   uint32 = 0x444E5343 // "DNSC"
-	binaryVersion uint16 = 1
+	binaryVersion uint16 = 2          // v2 adds per-entry ExpiresAt (R-06)
 )
 
 func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
@@ -590,14 +612,21 @@ func readBinaryEntry(r io.Reader) (Entry, string, error) {
 		return Entry{}, "", err
 	}
 
-	var createdAt, lastUsedAt int64
+	var createdAt, lastUsedAt, expiresAt int64
 	if err := binary.Read(r, binary.BigEndian, &createdAt); err != nil {
 		return Entry{}, "", err
 	}
 	if err := binary.Read(r, binary.BigEndian, &lastUsedAt); err != nil {
 		return Entry{}, "", err
 	}
+	if err := binary.Read(r, binary.BigEndian, &expiresAt); err != nil {
+		return Entry{}, "", err
+	}
 
+	exp := time.Time{}
+	if expiresAt != 0 {
+		exp = time.Unix(expiresAt, 0)
+	}
 	return Entry{
 		Domain:        string(domainBuf),
 		QuestionType:  qType,
@@ -605,6 +634,7 @@ func readBinaryEntry(r io.Reader) (Entry, string, error) {
 		Status:        StatusReady,
 		CreatedAt:     time.Unix(createdAt, 0),
 		LastUsedAt:    time.Unix(lastUsedAt, 0),
+		ExpiresAt:     exp,
 		Response:      resBuf,
 	}, string(keyBuf), nil
 }
@@ -642,6 +672,13 @@ func writeBinaryEntry(w io.Writer, key string, entry *Entry) error {
 		return err
 	}
 	if err := binary.Write(w, binary.BigEndian, entry.LastUsedAt.Unix()); err != nil {
+		return err
+	}
+	var expiresUnix int64
+	if !entry.ExpiresAt.IsZero() {
+		expiresUnix = entry.ExpiresAt.Unix()
+	}
+	if err := binary.Write(w, binary.BigEndian, expiresUnix); err != nil {
 		return err
 	}
 

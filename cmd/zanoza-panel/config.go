@@ -108,10 +108,23 @@ func loadConfig(path string) (*Config, error) {
 // canonical form and re-runs the multi-key/dup-key validation across the whole
 // set (F06).
 func (c *Config) canonicalizeAndValidateInstances() error {
+	// IDs must be non-empty and unique; otherwise validateInstance's "skip
+	// siblings with my ID" rule lets two same-ID records hide each other and
+	// bypass the multi-key/dup-key checks (R-05).
+	seen := make(map[string]struct{}, len(c.Instances))
 	for i := range c.Instances {
+		id := strings.TrimSpace(c.Instances[i].ID)
+		if id == "" {
+			return fmt.Errorf("instance at index %d has an empty id", i)
+		}
+		if _, dup := seen[id]; dup {
+			return fmt.Errorf("duplicate instance id %q", id)
+		}
+		seen[id] = struct{}{}
+
 		d, err := canonicalDomain(c.Instances[i].Domain)
 		if err != nil {
-			return fmt.Errorf("instance %q: %w", c.Instances[i].ID, err)
+			return fmt.Errorf("instance %q: %w", id, err)
 		}
 		c.Instances[i].Domain = d
 	}
