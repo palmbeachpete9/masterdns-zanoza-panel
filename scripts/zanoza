@@ -153,13 +153,15 @@ change_path(){
 }
 cert_menu(){
 	need_root
+	# Certificate-only: this must NEVER mutate credentials, port, path, binaries
+	# or source. We only re-issue an existing self-signed certificate; switching
+	# certificate MODE (Let's Encrypt / no-TLS) is an explicit reinstall (V4-08).
 	if [ -x /usr/local/bin/zanoza-renew-cert ]; then
 		/usr/local/bin/zanoza-renew-cert && c_g "Self-signed сертификат перевыпущен."
-	elif [ -f "$SRC_DIR/scripts/install.sh" ]; then
-		c_y "Запуск локального установщика для настройки сертификата..."
-		bash "$SRC_DIR/scripts/install.sh" || true
 	else
-		c_r "исходники не найдены в $SRC_DIR — переустановите панель для смены сертификата."
+		c_y "Для этой панели не настроен self-signed сертификат."
+		c_y "Смена режима сертификата выполняется отдельной переустановкой:"
+		echo "  curl -fsSL .../scripts/install.sh | sudo bash"
 	fi
 }
 uninstall(){

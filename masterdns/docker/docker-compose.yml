@@ -1,7 +1,16 @@
 services:
   masterdnsvpn:
-    image: ghcr.io/masterking32/masterdnsvpn:latest
+    # Pin to an immutable tag/digest instead of the mutable :latest (V4-08/V4-05).
+    image: ghcr.io/masterking32/masterdnsvpn:v1
     restart: unless-stopped
+    # Drop every Linux capability except the one needed to bind UDP/TCP :53, so
+    # a server compromise has minimal kernel-level reach (V4-08).
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
     environment:
       - DOMAIN=v.example.com
     volumes:

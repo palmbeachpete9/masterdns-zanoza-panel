@@ -1,5 +1,9 @@
 name: CI
 
+# NOTE: third-party actions below are referenced by major tag. They should be
+# pinned to immutable commit SHAs (managed by Dependabot) for full supply-chain
+# integrity (V4-05/V4-08); the distro shellcheck already avoids a mutable action.
+
 on:
   push:
     branches: [main]
@@ -62,17 +66,26 @@ jobs:
       # Build the pinned linter from the root module (reproducible, R-08).
       - run: go build -o "$RUNNER_TEMP/golangci-lint" github.com/golangci/golangci-lint/v2/cmd/golangci-lint
       - name: lint root module
-        run: "$RUNNER_TEMP/golangci-lint" run ./...
+        run: |
+          "$RUNNER_TEMP/golangci-lint" run ./...
       - name: gofumpt root + nested (enforced)
         run: |
           out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools masterdns/internal masterdns/cmd)"
           if [ -n "$out" ]; then echo "Unformatted files:"; echo "$out"; exit 1; fi
-      # Nested-module lint is informational for now (legacy upstream findings),
-      # but it runs on every PR so new regressions are visible (R-10).
-      - name: lint nested module (informational)
+      # The full nested-module run reports a reviewed baseline of legacy upstream
+      # findings (tracked, non-blocking).
+      - name: lint nested module (informational baseline)
         continue-on-error: true
         working-directory: masterdns
-        run: "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml ./...
+        run: |
+          "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml ./...
+      # ENFORCED on PRs: zero NEW nested-module findings relative to the base
+      # branch. Regressions of the same classes now block the merge (R-10/V4-09).
+      - name: lint nested module (enforce no new issues)
+        if: github.event_name == 'pull_request'
+        working-directory: masterdns
+        run: |
+          "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml --new-from-merge-base "origin/${{ github.base_ref }}" ./...
 
   frontend:
     name: Frontend build + typecheck + audit
@@ -92,9 +105,11 @@ jobs:
         run: git diff --exit-code -- cmd/zanoza-panel/web/dist
       # Production dependencies must have zero vulnerabilities (enforced, N03).
       - run: npm audit --omit=dev --audit-level=low
-      # Full audit (incl. dev-server tooling) is informational; the remaining
-      # advisories are dev-only Vite/esbuild dev-server issues (reviewed).
-      - run: npm audit || true
+      # Dev tooling: ENFORCE no high/critical advisories. The only currently
+      # accepted exceptions are two *moderate*, dev-server-only Vite/esbuild
+      # advisories (not reachable in the shipped panel, which embeds a static
+      # build). Review/upgrade target: next Vite major bump (V4-09).
+      - run: npm audit --audit-level=high
 
   shell:
     name: Shell syntax + ShellCheck

@@ -406,8 +406,19 @@ UNIT_PATH="/etc/systemd/system/zanoza-panel.service"
 [ -f "$UNIT_PATH" ]  && cp -f "$UNIT_PATH"  "${UNIT_PATH}.bak"
 [ -f "$CLI_BIN" ]    && cp -f "$CLI_BIN"    "${CLI_BIN}.bak"
 
-install -m 0644 "$SRC_DIR/packaging/systemd/zanoza-panel.service" "$UNIT_PATH"
-install -m 0755 "$SRC_DIR/scripts/zanoza" "$CLI_BIN"
+# Render the unit + CLI with the SELECTED config dir and service user, so
+# non-default ZANOZA_CONFIG_DIR / ZANOZA_SRC_DIR / ZANOZA_SVC_USER overrides are
+# actually honoured by the installed service and management command (V4-08).
+sed -e "s#/etc/zanoza-panel#${CONFIG_DIR}#g" \
+    -e "s#^User=zanoza#User=${SVC_USER}#" \
+    -e "s#^Group=zanoza#Group=${SVC_USER}#" \
+    "$SRC_DIR/packaging/systemd/zanoza-panel.service" > "${UNIT_PATH}.gen"
+install -m 0644 "${UNIT_PATH}.gen" "$UNIT_PATH"; rm -f "${UNIT_PATH}.gen"
+sed -e "s#^CONFIG_DIR=\"/etc/zanoza-panel\"#CONFIG_DIR=\"${CONFIG_DIR}\"#" \
+    -e "s#^SRC_DIR=\"/opt/masterdns-zanoza-panel\"#SRC_DIR=\"${SRC_DIR}\"#" \
+    -e "s#:-zanoza}#:-${SVC_USER}}#" \
+    "$SRC_DIR/scripts/zanoza" > "${CLI_BIN}.gen"
+install -m 0755 "${CLI_BIN}.gen" "$CLI_BIN"; rm -f "${CLI_BIN}.gen"
 mv -f "${PANEL_BIN}.new"  "$PANEL_BIN"
 mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
 
