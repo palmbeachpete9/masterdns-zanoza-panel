@@ -5,8 +5,10 @@
 package main
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,9 +37,60 @@ type server struct {
 	sessions *sessionStore
 	limiter  *loginLimiter
 	manager  *serverManager
-	webFS    fs.FS
+	assets   map[string]cachedFile
 	useTLS   bool
 	mu       sync.Mutex
+}
+
+// cachedFile is an embedded static asset preloaded into shared memory once at
+// startup, so serving it never re-reads/re-allocates the whole file per request.
+type cachedFile struct {
+	body        []byte
+	contentType string
+	etag        string
+}
+
+// buildAssetCache reads every embedded file once and computes a content ETag.
+// The byte slices are shared read-only across all requests.
+func buildAssetCache(root fs.FS) (map[string]cachedFile, error) {
+	cache := map[string]cachedFile{}
+	err := fs.WalkDir(root, ".", func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+		body, err := fs.ReadFile(root, p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(body)
+		cache[p] = cachedFile{
+			body:        body,
+			contentType: contentTypeFor(p),
+			etag:        `"` + hex.EncodeToString(sum[:16]) + `"`,
+		}
+		return nil
+	})
+	return cache, err
+}
+
+func contentTypeFor(name string) string {
+	switch {
+	case strings.HasSuffix(name, ".html"):
+		return "text/html; charset=utf-8"
+	case strings.HasSuffix(name, ".js"):
+		return "text/javascript; charset=utf-8"
+	case strings.HasSuffix(name, ".css"):
+		return "text/css; charset=utf-8"
+	case strings.HasSuffix(name, ".svg"):
+		return "image/svg+xml"
+	case strings.HasSuffix(name, ".json"):
+		return "application/json; charset=utf-8"
+	default:
+		return "application/octet-stream"
+	}
 }
 
 func main() {
@@ -75,6 +128,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("embed web: %v", err)
 	}
+	assets, err := buildAssetCache(webRoot)
+	if err != nil {
+		log.Fatalf("embed web cache: %v", err)
+	}
 
 	// TLS mode is explicit and fail-closed (F05): if certificate paths are
 	// configured, the key pair MUST load before we listen. We never silently
@@ -102,7 +159,7 @@ func main() {
 		sessions: newSessionStore(),
 		limiter:  newLoginLimiter(8, 5*time.Minute),
 		manager:  manager,
-		webFS:    webRoot,
+		assets:   assets,
 		useTLS:   useTLS,
 	}
 
@@ -217,30 +274,33 @@ func (s *server) route(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) serveIndex(w http.ResponseWriter, _ *http.Request) {
-	raw, err := fs.ReadFile(s.webFS, "index.html")
-	if err != nil {
+	f, ok := s.assets["index.html"]
+	if !ok {
 		http.Error(w, "index missing", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Shared cached bytes: no per-request file read/allocation.
+	w.Header().Set("Content-Type", f.contentType)
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write(raw)
+	_, _ = w.Write(f.body)
 }
 
 func (s *server) serveAsset(w http.ResponseWriter, r *http.Request, rest string) {
-	raw, err := fs.ReadFile(s.webFS, rest)
-	if err != nil {
+	f, ok := s.assets[rest]
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
-	switch {
-	case strings.HasSuffix(rest, ".js"):
-		w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
-	case strings.HasSuffix(rest, ".css"):
-		w.Header().Set("Content-Type", "text/css; charset=utf-8")
-	}
+	w.Header().Set("Content-Type", f.contentType)
 	w.Header().Set("Cache-Control", "public, max-age=86400")
-	_, _ = w.Write(raw)
+	w.Header().Set("ETag", f.etag)
+	// Revalidation: an unchanged asset returns 304 with no body, so a polling
+	// browser neither re-downloads nor makes the server re-serve the bytes.
+	if r.Header.Get("If-None-Match") == f.etag {
+		w.WriteHeader(http.StatusNotModified)
+		return
+	}
+	_, _ = w.Write(f.body)
 }
 
 // ---------------------------------------------------------------------------
