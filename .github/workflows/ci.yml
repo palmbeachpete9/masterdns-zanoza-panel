@@ -11,6 +11,8 @@ permissions:
 env:
   # Security patch floor (N01): must be >= the latest fixed stdlib patch level.
   GO_VERSION: "1.25.11"
+  # Pinned tool versions for reproducible CI (R-08).
+  GOVULNCHECK_VERSION: "v1.1.4"
 
 jobs:
   go-panel:
@@ -27,7 +29,7 @@ jobs:
       - run: go test -shuffle=on -count=2 ./cmd/...
       - run: go test -race -shuffle=on -count=1 ./cmd/...
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
 
   go-masterdns:
     name: MasterDNS (nested module)
@@ -46,10 +48,10 @@ jobs:
       - run: go test -shuffle=on -count=2 ./...
       - run: go test -race -shuffle=on -count=10 ./...
       - name: govulncheck
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }} ./...
 
   lint:
-    name: golangci-lint + gofumpt
+    name: golangci-lint + gofumpt (both modules)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -57,11 +59,20 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
-      - run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint run ./...
-      - name: gofumpt formatting
+      # Build the pinned linter from the root module (reproducible, R-08).
+      - run: go build -o "$RUNNER_TEMP/golangci-lint" github.com/golangci/golangci-lint/v2/cmd/golangci-lint
+      - name: lint root module
+        run: "$RUNNER_TEMP/golangci-lint" run ./...
+      - name: gofumpt root + nested (enforced)
         run: |
-          out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools)"
+          out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools masterdns/internal masterdns/cmd)"
           if [ -n "$out" ]; then echo "Unformatted files:"; echo "$out"; exit 1; fi
+      # Nested-module lint is informational for now (legacy upstream findings),
+      # but it runs on every PR so new regressions are visible (R-10).
+      - name: lint nested module (informational)
+        continue-on-error: true
+        working-directory: masterdns
+        run: "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml ./...
 
   frontend:
     name: Frontend build + typecheck + audit
@@ -75,6 +86,10 @@ jobs:
       - run: npm ci
       - run: npx tsc --noEmit
       - run: npm run build
+      # Generated assets must be clean after a build — no stale/duplicate
+      # embedded files (R-11).
+      - name: assert generated assets are clean
+        run: git diff --exit-code -- cmd/zanoza-panel/web/dist
       # Production dependencies must have zero vulnerabilities (enforced, N03).
       - run: npm audit --omit=dev --audit-level=low
       # Full audit (incl. dev-server tooling) is informational; the remaining

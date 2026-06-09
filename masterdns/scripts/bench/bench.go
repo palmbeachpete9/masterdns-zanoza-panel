@@ -127,7 +127,7 @@ func setupDirs() error {
 	}
 
 	for _, d := range []string{benchDir, binDir, runtimeDir} {
-		if err := os.MkdirAll(d, 0755); err != nil {
+		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
 	}
@@ -225,7 +225,7 @@ func runOnce(ctx context.Context, direction string, runIndex int) (BenchResult, 
 	ARQ_DATA_NACK_REPEAT_SECONDS = 0.8
 	ARQ_TERMINAL_DRAIN_TIMEOUT_SECONDS = 120.0
 	ARQ_TERMINAL_ACK_WAIT_TIMEOUT_SECONDS = 90.0
-	`, *serverPort, targetPort)), 0644)
+	`, *serverPort, targetPort)), 0o644)
 
 	// 3. Start Server
 	absServerBin, _ := filepath.Abs(filepath.Join(binDir, "server.exe"))
@@ -248,7 +248,7 @@ func runOnce(ctx context.Context, direction string, runIndex int) (BenchResult, 
 
 	// 4. Start Client
 	resolverFile, _ := filepath.Abs(filepath.Join(runtimeDir, "client_resolvers.txt"))
-	os.WriteFile(resolverFile, []byte(fmt.Sprintf("127.0.0.1:%d\n", *serverPort)), 0644)
+	os.WriteFile(resolverFile, []byte(fmt.Sprintf("127.0.0.1:%d\n", *serverPort)), 0o644)
 
 	os.WriteFile(clientCfg, []byte(fmt.Sprintf(`
 	PROTOCOL_TYPE = "TCP"
@@ -303,7 +303,7 @@ func runOnce(ctx context.Context, direction string, runIndex int) (BenchResult, 
 	ARQ_MAX_CONTROL_RETRIES = 300
 	ARQ_DATA_NACK_INITIAL_DELAY_SECONDS = 0.35
 	ARQ_DATA_NACK_REPEAT_SECONDS = 0.8
-	`, *clientPort, encryptionKey)), 0644)
+	`, *clientPort, encryptionKey)), 0o644)
 
 	absClientBin, _ := filepath.Abs(filepath.Join(binDir, "client.exe"))
 	clientCmd := exec.Command(absClientBin, "--config", clientCfg)
@@ -382,16 +382,16 @@ func (b *safeBuffer) String() string {
 }
 
 func persistRunLogs(direction string, runIndex int, serverLog, clientLog *safeBuffer) {
-	if err := os.MkdirAll(runtimeDir, 0755); err != nil {
+	if err := os.MkdirAll(runtimeDir, 0o755); err != nil {
 		return
 	}
 	if serverLog != nil {
 		serverPath, _ := filepath.Abs(filepath.Join(runtimeDir, fmt.Sprintf("%s-run-%d-server.log", direction, runIndex)))
-		_ = os.WriteFile(serverPath, []byte(serverLog.String()), 0644)
+		_ = os.WriteFile(serverPath, []byte(serverLog.String()), 0o644)
 	}
 	if clientLog != nil {
 		clientPath, _ := filepath.Abs(filepath.Join(runtimeDir, fmt.Sprintf("%s-run-%d-client.log", direction, runIndex)))
-		_ = os.WriteFile(clientPath, []byte(clientLog.String()), 0644)
+		_ = os.WriteFile(clientPath, []byte(clientLog.String()), 0o644)
 	}
 }
 

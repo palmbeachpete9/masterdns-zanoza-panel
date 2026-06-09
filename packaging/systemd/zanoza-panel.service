@@ -6,6 +6,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Run unprivileged: the panel and the MasterDnsVPN child it spawns both run as
+# the dedicated `zanoza` user (created by the installer). The child still binds
+# UDP :53 via the inherited ambient CAP_NET_BIND_SERVICE — no root (R-09/F26).
+User=zanoza
+Group=zanoza
 Environment=ZANOZA_MASTERDNS_BIN=/usr/local/bin/masterdns-server
 ExecStart=/usr/local/bin/zanoza-panel -config /etc/zanoza-panel/config.json
 ExecReload=/bin/kill -HUP $MAINPID
@@ -15,11 +20,9 @@ KillSignal=SIGTERM
 TimeoutStopSec=15s
 
 # ---------------------------------------------------------------------------
-# Hardening (F26). The panel supervises the MasterDnsVPN child which binds
-# UDP :53, so the unit retains only CAP_NET_BIND_SERVICE (low-port bind) and
-# drops every other capability — even though it runs as root for the bind.
-# The longer-term hardening is a full service split (dedicated unprivileged
-# panel user + dedicated masterdns user with a socket unit for :53).
+# Hardening. CAP_NET_BIND_SERVICE is the ONLY capability granted (low-port bind
+# for :53); everything else is dropped, and the writable surface is restricted
+# to the panel's own state directory.
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE

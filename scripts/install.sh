@@ -21,6 +21,7 @@ CONFIG_DIR="${ZANOZA_CONFIG_DIR:-/etc/zanoza-panel}"
 CONFIG_PATH="$CONFIG_DIR/config.json"
 TLS_CERT="$CONFIG_DIR/tls.crt"
 TLS_KEY="$CONFIG_DIR/tls.key"
+SVC_USER="${ZANOZA_SVC_USER:-zanoza}"  # unprivileged service account (R-09)
 PANEL_BIN="/usr/local/bin/zanoza-panel"
 SERVER_BIN="/usr/local/bin/masterdns-server"
 CLI_BIN="/usr/local/bin/zanoza"
@@ -76,8 +77,9 @@ norm_path() {
 	[ "${p#/}" = "$p" ] && p="/$p"
 	p="/$(printf '%s' "$p" | sed 's#^/*##; s#/*$##')"
 	[ "$p" = "/" ] && return 1
-	case "$p" in */*/*) return 1;; esac
-	case "$p" in *' '*|*'?'*|*'#'*|*'%'*) return 1;; esac
+	# Single safe-slug segment only — rejects spaces, tabs, newlines, control
+	# characters, query/fragment and nested slashes (R-07).
+	case "${p#/}" in *[!A-Za-z0-9_-]*) return 1;; esac
 	printf '%s' "$p"
 }
 
@@ -88,6 +90,16 @@ log "Установка пакетов..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y git curl ca-certificates openssl iproute2 build-essential socat cron >/dev/null
+
+# Dedicated unprivileged service account (R-09).
+ensure_svc_user() {
+	id -u "$SVC_USER" >/dev/null 2>&1 && return
+	log "Создание системного пользователя ${SVC_USER}..."
+	useradd --system --no-create-home --shell /usr/sbin/nologin "$SVC_USER" 2>/dev/null \
+		|| adduser --system --no-create-home --group "$SVC_USER" 2>/dev/null \
+		|| die "не удалось создать пользователя ${SVC_USER}"
+}
+ensure_svc_user
 
 # go_expected_sha256 returns the pinned checksum for arch, or fetches the
 # official one published at go.dev (HTTPS) so a corrupted download is rejected
@@ -140,6 +152,19 @@ export PATH="/usr/local/go/bin:$PATH"
 # --------------------------------------------------------------------------
 # Source + build
 # --------------------------------------------------------------------------
+# Pin the build source for reproducibility/supply-chain safety: warn (or refuse)
+# when building from a mutable branch instead of a tag/commit SHA (R-08). Set
+# ZANOZA_REF to an immutable tag/commit, or ZANOZA_ALLOW_MUTABLE_REF=1 to silence.
+case "$REF" in
+	main|master)
+		if [ "${ZANOZA_ALLOW_MUTABLE_REF:-0}" = "1" ]; then
+			warn "Сборка из изменяемой ветки '$REF' (ZANOZA_ALLOW_MUTABLE_REF=1)."
+		else
+			warn "Сборка из изменяемой ветки '$REF'. Для воспроизводимости задайте ZANOZA_REF=<тег|коммит>."
+		fi
+		;;
+esac
+
 # A failed fetch/reset must NOT silently fall through to building stale local
 # source (F27). On update we hard-fail; on fresh install we clone or die.
 if [ -d "$SRC_DIR/.git" ]; then
@@ -229,6 +254,7 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
   -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" -addext "subjectAltName=IP:\${host}" 2>/dev/null || \
 openssl req -x509 -newkey rsa:2048 -nodes -days 6 -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" 2>/dev/null
 chmod 600 "$TLS_KEY"
+chown ${SVC_USER}:${SVC_USER} "$TLS_CERT" "$TLS_KEY" 2>/dev/null || true
 systemctl restart zanoza-panel 2>/dev/null || true
 RENEW
 	chmod 755 /usr/local/bin/zanoza-renew-cert
@@ -293,7 +319,7 @@ case "$cert_choice" in
 			if ~/.acme.sh/acme.sh --issue --standalone -d "$domain" >/dev/null 2>&1; then
 				~/.acme.sh/acme.sh --install-cert -d "$domain" \
 					--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
-					--reloadcmd "systemctl restart zanoza-panel" >/dev/null 2>&1
+					--reloadcmd "chown ${SVC_USER}:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null; systemctl restart zanoza-panel" >/dev/null 2>&1
 			else
 				warn "Let's Encrypt не удался (проверьте A-запись и свободный :80). Откат на self-signed."
 				setup_self_signed "$domain"
@@ -363,15 +389,27 @@ install -m 0755 "$SRC_DIR/scripts/zanoza" "$CLI_BIN"
 mv -f "${PANEL_BIN}.new"  "$PANEL_BIN"
 mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
 
+# Hand ALL runtime state to the unprivileged service user so the panel can run
+# without root (R-09). Binaries stay root-owned + world-executable.
+mkdir -p "$CONFIG_DIR/masterdns"
+chown -R "${SVC_USER}:${SVC_USER}" "$CONFIG_DIR"
+chmod 750 "$CONFIG_DIR"
+
+# rollback_update restores each replaced artifact from its .bak, or REMOVES it
+# when there was no prior version (a failed fresh install must not leave a
+# partial installation behind) (R-07).
 rollback_update() {
-	warn "$1 — откат к предыдущей версии."
-	[ -f "${PANEL_BIN}.bak" ]  && mv -f "${PANEL_BIN}.bak"  "$PANEL_BIN"
-	[ -f "${SERVER_BIN}.bak" ] && mv -f "${SERVER_BIN}.bak" "$SERVER_BIN"
-	[ -f "${UNIT_PATH}.bak" ]  && mv -f "${UNIT_PATH}.bak"  "$UNIT_PATH"
-	[ -f "${CLI_BIN}.bak" ]    && mv -f "${CLI_BIN}.bak"    "$CLI_BIN"
+	warn "$1 — откат."
+	for art in "$PANEL_BIN" "$SERVER_BIN" "$UNIT_PATH" "$CLI_BIN"; do
+		if [ -f "${art}.bak" ]; then
+			mv -f "${art}.bak" "$art"
+		else
+			rm -f "$art"
+		fi
+	done
 	systemctl daemon-reload 2>/dev/null || true
 	systemctl restart zanoza-panel 2>/dev/null || true
-	die "обновление откатано: $1"
+	die "установка/обновление откатаны: $1"
 }
 
 systemctl daemon-reload
@@ -390,12 +428,20 @@ if command -v python3 >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
 	python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('instances') else 1)" && HAS_INSTANCES=1 || true
 fi
 if [ "$HAS_INSTANCES" = "1" ]; then
+	# Content-bound readiness: the running server must acknowledge the EXACT
+	# keyring digest we wrote (keyring.json.applied), not merely have a process
+	# whose path matches (R-07/R-03).
+	kr="$CONFIG_DIR/masterdns/keyring.json"
 	ok=0
-	for _ in 1 2 3 4 5 6; do
-		if pgrep -f "$SERVER_BIN" >/dev/null 2>&1; then ok=1; break; fi
+	for _ in 1 2 3 4 5 6 7 8; do
+		if [ -f "$kr" ] && [ -f "$kr.applied" ]; then
+			want="$(sha256sum "$kr" | awk '{print $1}')"
+			got="$(tr -d '[:space:]' < "$kr.applied" 2>/dev/null)"
+			[ -n "$want" ] && [ "$want" = "$got" ] && { ok=1; break; }
+		fi
 		sleep 1
 	done
-	[ "$ok" = "1" ] || rollback_update "MasterDNS-сервер не запустился (хосты настроены)"
+	[ "$ok" = "1" ] || rollback_update "MasterDNS не подтвердил применённый keyring (хосты настроены)"
 fi
 
 rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak" "${UNIT_PATH}.bak" "${CLI_BIN}.bak"

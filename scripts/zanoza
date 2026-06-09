@@ -22,8 +22,9 @@ norm_path(){
 	[ "${p#/}" = "$p" ] && p="/$p"
 	p="/$(printf '%s' "$p" | sed 's#^/*##; s#/*$##')"
 	[ "$p" = "/" ] && return 1
-	case "$p" in */*/*) return 1;; esac
-	case "$p" in *' '*|*'?'*|*'#'*|*'%'*) return 1;; esac
+	# Single segment of a safe slug only: rejects spaces, tabs, newlines,
+	# control characters, query/fragment and nested slashes (R-07).
+	case "${p#/}" in *[!A-Za-z0-9_-]*) return 1;; esac
 	printf '%s' "$p"
 }
 
@@ -34,13 +35,25 @@ need_root(){ [ "$(id -u)" -eq 0 ] || { c_r "запустите от root (sudo z
 
 jget(){ python3 -c "import json,sys; print(json.load(open('$CONFIG_PATH')).get('$1',''))" 2>/dev/null || true; }
 jset(){ python3 - "$1" "$2" <<'PY'
-import json,sys
+import json,sys,os,tempfile
 k,v=sys.argv[1],sys.argv[2]
 p="/etc/zanoza-panel/config.json"
 c=json.load(open(p))
 if k=="panel_port": v=int(v)
 c[k]=v
-json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
+# Atomic write: temp file in the same dir, then rename — never truncate the
+# live config on interruption (R-07).
+d=os.path.dirname(p) or "."
+fd,tmp=tempfile.mkstemp(dir=d)
+try:
+    with os.fdopen(fd,"w") as f:
+        json.dump(c,f,indent=2,ensure_ascii=False)
+    os.chmod(tmp,0o600)
+    os.replace(tmp,p)
+except Exception:
+    try: os.unlink(tmp)
+    except OSError: pass
+    raise
 PY
 }
 
@@ -94,17 +107,32 @@ reset_creds(){
 	echo "  Адрес:  $(panel_url)"
 }
 
+# apply_config_change snapshots config.json, applies a key/value, restarts and
+# verifies the service, and rolls back the config if the restart fails (R-07).
+apply_config_change(){
+	local key="$1" val="$2" label="$3"
+	cp -f "$CONFIG_PATH" "$CONFIG_PATH.bak"
+	jset "$key" "$val"
+	if systemctl restart "$SERVICE" && systemctl is-active --quiet "$SERVICE"; then
+		rm -f "$CONFIG_PATH.bak"
+		c_g "${label} изменён -> $(panel_url)"
+	else
+		mv -f "$CONFIG_PATH.bak" "$CONFIG_PATH"
+		systemctl restart "$SERVICE" 2>/dev/null || true
+		c_r "перезапуск не удался — изменение откатано."
+	fi
+}
 change_port(){
 	need_root
 	read -r -p "Новый порт: " p
 	if ! p="$(valid_port "$p")"; then c_r "порт должен быть числом 1..65535"; return; fi
-	jset panel_port "$p"; systemctl restart "$SERVICE"; c_g "Порт изменён -> $(panel_url)"
+	apply_config_change panel_port "$p" "Порт"
 }
 change_path(){
 	need_root
 	read -r -p "Новый путь (например /secret): " p
-	if ! p="$(norm_path "$p")"; then c_r "недопустимый путь (без пробелов, ? # %, вложенных слешей, и не «/»)"; return; fi
-	jset panel_path "$p"; systemctl restart "$SERVICE"; c_g "Путь изменён -> $(panel_url)"
+	if ! p="$(norm_path "$p")"; then c_r "недопустимый путь (только буквы/цифры/_/-, один сегмент, не «/»)"; return; fi
+	apply_config_change panel_path "$p" "Путь"
 }
 cert_menu(){
 	need_root
