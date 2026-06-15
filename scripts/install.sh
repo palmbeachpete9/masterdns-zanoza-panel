@@ -339,9 +339,19 @@ case "$cert_choice" in
 		if [ -x ~/.acme.sh/acme.sh ]; then
 			~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 			if ~/.acme.sh/acme.sh --issue --standalone -d "$domain" >/dev/null 2>&1; then
-				~/.acme.sh/acme.sh --install-cert -d "$domain" \
+				# install-cert's --reloadcmd restarts the panel, which is NOT
+				# installed yet during the initial install. The reloadcmd must
+				# therefore tolerate a missing service (|| true), and the whole
+				# install-cert must run inside `if` so a failure falls back to
+				# self-signed instead of aborting the install under `set -e`.
+				if ~/.acme.sh/acme.sh --install-cert -d "$domain" \
 					--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
-					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null; systemctl restart zanoza-panel" >/dev/null 2>&1
+					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; systemctl restart zanoza-panel 2>/dev/null || true" >/dev/null 2>&1; then
+					log "Сертификат Let's Encrypt установлен для ${domain}."
+				else
+					warn "Установка сертификата Let's Encrypt не удалась — откат на self-signed."
+					setup_self_signed "$domain"
+				fi
 			else
 				warn "Let's Encrypt не удался (проверьте A-запись и свободный :80). Откат на self-signed."
 				setup_self_signed "$domain"
