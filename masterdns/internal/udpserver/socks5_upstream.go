@@ -18,8 +18,9 @@ import (
 	"strings"
 	"time"
 
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/logger"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 type upstreamSOCKS5Error struct {
@@ -230,15 +231,14 @@ func isBlockedTargetIP(ip net.IP) bool {
 	return false
 }
 
-func (s *Server) dialTCPTarget(address string) (net.Conn, error) {
-	return s.dialTCPTargetContext(context.Background(), address)
-}
-
 func (s *Server) dialTCPTargetContext(ctx context.Context, address string) (net.Conn, error) {
 	dialFn := s.dialStreamUpstreamFn
 	timeout := s.socksConnectTimeout
 	if timeout <= 0 {
 		timeout = s.cfg.SOCKSConnectTimeout()
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		untilDeadline := time.Until(deadline)
@@ -251,10 +251,6 @@ func (s *Server) dialTCPTargetContext(ctx context.Context, address string) (net.
 	if dialFn == nil {
 		dialer := net.Dialer{Timeout: timeout}
 		conn, err := dialer.DialContext(ctx, "tcp", address)
-		return conn, err
-	}
-	if ctx == nil {
-		conn, err := dialFn("tcp", address, timeout)
 		return conn, err
 	}
 	type dialResult struct {
@@ -286,10 +282,6 @@ func (s *Server) dialTCPTargetContext(ctx context.Context, address string) (net.
 		}
 		return result.conn, result.err
 	}
-}
-
-func (s *Server) dialExternalSOCKS5Target(targetPayload []byte) (net.Conn, error) {
-	return s.dialExternalSOCKS5TargetContext(context.Background(), targetPayload)
 }
 
 func (s *Server) dialExternalSOCKS5TargetContext(ctx context.Context, targetPayload []byte) (net.Conn, error) {

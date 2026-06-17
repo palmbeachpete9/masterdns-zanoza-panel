@@ -23,8 +23,10 @@ var (
 )
 
 const (
-	dnsHeaderSize = 12
-	maxNameJumps  = 10
+	dnsHeaderSize       = 12
+	maxNameJumps        = 10
+	minQuestionWireSize = 5  // root name + type + class
+	minRecordWireSize   = 11 // root name + fixed record header
 )
 
 type Header struct {
@@ -144,9 +146,12 @@ func ParsePacket(data []byte) (Packet, error) {
 	}
 	offset = nextOffset
 
-	additional, _, err := parseResourceRecords(data, offset, int(header.ARCount))
+	additional, nextOffset, err := parseResourceRecords(data, offset, int(header.ARCount))
 	if err != nil {
 		return Packet{}, err
+	}
+	if nextOffset != len(data) {
+		return Packet{}, ErrInvalidAnswer
 	}
 
 	return Packet{
@@ -182,6 +187,9 @@ func parseQuestions(data []byte, offset, count int) ([]Question, int, error) {
 	if count == 0 {
 		return nil, offset, nil
 	}
+	if offset < 0 || offset > len(data) || count > (len(data)-offset)/minQuestionWireSize {
+		return nil, offset, ErrInvalidQuestion
+	}
 
 	questions := make([]Question, count)
 	for i := range count {
@@ -209,6 +217,9 @@ func parseQuestions(data []byte, offset, count int) ([]Question, int, error) {
 func parseResourceRecords(data []byte, offset, count int) ([]ResourceRecord, int, error) {
 	if count == 0 {
 		return nil, offset, nil
+	}
+	if offset < 0 || offset > len(data) || count > (len(data)-offset)/minRecordWireSize {
+		return nil, offset, ErrInvalidAnswer
 	}
 
 	records := make([]ResourceRecord, count)

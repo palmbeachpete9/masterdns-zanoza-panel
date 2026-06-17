@@ -1,9 +1,11 @@
 package main
 
 import (
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"testing/fstest"
 )
 
 // Static assets are served from a shared in-memory cache (no per-request
@@ -47,5 +49,29 @@ func TestServeAssetCachedWithETag(t *testing.T) {
 	s.serveAsset(w3, httptest.NewRequest(http.MethodGet, "/admin/assets/nope.js", nil), "assets/nope.js")
 	if w3.Code != http.StatusNotFound {
 		t.Fatalf("unknown asset: code=%d want 404", w3.Code)
+	}
+}
+
+func TestBuildAssetCacheRejectsConflictCopies(t *testing.T) {
+	root := fstest.MapFS{
+		"index.html":         &fstest.MapFile{Data: []byte("ok")},
+		"assets/app.js":      &fstest.MapFile{Data: []byte("original")},
+		"assets/app 2.js":    &fstest.MapFile{Data: []byte("duplicate")},
+		"assets/app-main.js": &fstest.MapFile{Data: []byte("ok")},
+	}
+	if _, err := buildAssetCache(root); err == nil {
+		t.Fatal("conflict-copy asset was accepted")
+	}
+
+	delete(root, "assets/app 2.js")
+	cache, err := buildAssetCache(root)
+	if err != nil {
+		t.Fatalf("clean assets rejected: %v", err)
+	}
+	if len(cache) != 3 {
+		t.Fatalf("cache contains %d files, want 3", len(cache))
+	}
+	if _, err := fs.Stat(root, "assets/app-main.js"); err != nil {
+		t.Fatal(err)
 	}
 }

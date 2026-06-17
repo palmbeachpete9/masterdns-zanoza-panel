@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"masterdnsvpn-go/internal/compression"
+
 	Enums "masterdnsvpn-go/internal/enums"
 )
 

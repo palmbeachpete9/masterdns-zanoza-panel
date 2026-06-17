@@ -18,10 +18,11 @@ import (
 	"fmt"
 	"sync"
 
+	"masterdnsvpn-go/internal/config"
+
 	"golang.org/x/crypto/chacha20"
 
 	baseCodec "masterdnsvpn-go/internal/basecodec"
-	"masterdnsvpn-go/internal/config"
 )
 
 var (

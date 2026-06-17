@@ -1,10 +1,15 @@
 package keyring
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/security"
+
+	Enums "masterdnsvpn-go/internal/enums"
+
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -96,5 +101,97 @@ func TestUnknownDomainRejected(t *testing.T) {
 	r, _ := FromEntries([]Entry{{Domain: "v.a.com", Key: keyA, Method: 1}})
 	if _, err := r.Parse("v.unknown.com", "labels"); err == nil {
 		t.Error("Parse should reject an unconfigured domain")
+	}
+}
+
+func TestWriteAppliedIsPrivateAndLeavesNoTempFile(t *testing.T) {
+	keyringPath := filepath.Join(t.TempDir(), "keyring.json")
+	if err := WriteApplied(keyringPath, "abc", 7); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(keyringPath + ".applied")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("applied marker mode = %o, want 600", info.Mode().Perm())
+	}
+	matches, err := filepath.Glob(filepath.Join(filepath.Dir(keyringPath), ".keyring.json.applied.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary applied markers left behind: %v", matches)
+	}
+}
+
+func TestFromEntriesRejectsDomainsThatCannotAppearOnWire(t *testing.T) {
+	for _, domain := range []string{
+		"single-label",
+		"bad..example.com",
+		"-bad.example.com",
+		"bad_.example.com",
+		"bad.example.com..",
+	} {
+		t.Run(domain, func(t *testing.T) {
+			if _, err := FromEntries([]Entry{{Domain: domain, Key: "k", Method: 5}}); err == nil {
+				t.Fatalf("invalid domain %q was accepted", domain)
+			}
+		})
+	}
+}
+
+func TestFromEntriesRejectsExcessiveEntryCount(t *testing.T) {
+	entries := make([]Entry, maxKeyringEntries+1)
+	if _, err := FromEntries(entries); err == nil {
+		t.Fatal("excessive keyring entry count was accepted")
+	}
+}
+
+func TestLoadRejectsOversizedKeyringBeforeDecode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keyring.json")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), maxKeyringBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Fatal("oversized keyring was accepted")
+	}
+}
+
+func TestLoadTightensExistingKeyringMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keyring.json")
+	body := `{"version":1,"generation":7,"instances":[{"domain":"v.example.com","key":"` + keyA + `","method":5}]}`
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("keyring mode = %o, want 600", got)
+	}
+}
+
+func TestLoadRejectsAmbiguousOrUnsupportedKeyringJSON(t *testing.T) {
+	for name, body := range map[string]string{
+		"duplicate root key":             `{"version":1,"version":1,"generation":1,"instances":[]}`,
+		"case-folded duplicate root key": `{"version":1,"Version":1,"generation":1,"instances":[]}`,
+		"duplicate entry key":            `{"version":1,"generation":1,"instances":[{"domain":"v.example.com","key":"a","key":"b","method":5}]}`,
+		"unknown field":                  `{"version":1,"generation":1,"instances":[],"typo":true}`,
+		"unsupported version":            `{"version":2,"generation":1,"instances":[]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "keyring.json")
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(path); err == nil {
+				t.Fatalf("%s was accepted", name)
+			}
+		})
 	}
 }

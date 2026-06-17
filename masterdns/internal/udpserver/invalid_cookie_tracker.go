@@ -25,21 +25,30 @@ type invalidCookieTrackerRecord struct {
 }
 
 type invalidCookieTracker struct {
-	mu      sync.Mutex
-	records map[invalidCookieTrackerKey]invalidCookieTrackerRecord
+	mu         sync.Mutex
+	records    map[invalidCookieTrackerKey]invalidCookieTrackerRecord
+	maxRecords int
 }
 
-const unknownExpectedCookieMarker = 256
+const (
+	unknownExpectedCookieMarker = 256
+	defaultInvalidCookieRecords = 4096
+	maxInvalidCookieAttempts    = 64
+)
 
 func newInvalidCookieTracker() *invalidCookieTracker {
 	return &invalidCookieTracker{
-		records: make(map[invalidCookieTrackerKey]invalidCookieTrackerRecord, 16),
+		records:    make(map[invalidCookieTrackerKey]invalidCookieTrackerRecord, 16),
+		maxRecords: defaultInvalidCookieRecords,
 	}
 }
 
 func (t *invalidCookieTracker) Note(sessionID uint8, lookup sessionLookupResult, known bool, packetCookie uint8, nowUnix, windowNanos int64, threshold int) bool {
 	if t == nil || windowNanos <= 0 || threshold <= 0 {
 		return false
+	}
+	if threshold > maxInvalidCookieAttempts {
+		threshold = maxInvalidCookieAttempts
 	}
 
 	expected := uint16(unknownExpectedCookieMarker)
@@ -57,7 +66,13 @@ func (t *invalidCookieTracker) Note(sessionID uint8, lookup sessionLookupResult,
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	record := t.records[key]
+	record, exists := t.records[key]
+	if !exists && len(t.records) >= t.maxRecords {
+		t.cleanupLocked(cutoff)
+		if len(t.records) >= t.maxRecords {
+			return false
+		}
+	}
 	record.attempts = pruneAttemptTimes(record.attempts, cutoff)
 	record.attempts = appendBoundedAttempt(record.attempts, nowUnix, threshold)
 	if len(record.attempts) < threshold {
@@ -83,7 +98,10 @@ func (t *invalidCookieTracker) Cleanup(now time.Time, window time.Duration) {
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.cleanupLocked(cutoff)
+}
 
+func (t *invalidCookieTracker) cleanupLocked(cutoff int64) {
 	for key, record := range t.records {
 		record.attempts = pruneAttemptTimes(record.attempts, cutoff)
 		if len(record.attempts) == 0 && (record.lastEmitAt == 0 || record.lastEmitAt < cutoff) {

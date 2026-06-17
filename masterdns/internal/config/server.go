@@ -10,7 +10,7 @@ package config
 import (
 	"flag"
 	"fmt"
-	"os"
+	"net"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -18,9 +18,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
-
 	"masterdnsvpn-go/internal/compression"
+
+	"github.com/BurntSushi/toml"
 )
 
 type ServerConfig struct {
@@ -105,6 +105,12 @@ type ServerConfig struct {
 	ClientMinCompressionMinSize     int     `toml:"MIN_ALLOWED_CLIENT_COMPRESSION_MIN_SIZE"`
 	ClientMinARQInitialRTOSeconds   float64 `toml:"MIN_ALLOWED_CLIENT_ARQ_INITIAL_RTO_SECONDS"`
 }
+
+const (
+	maxConfiguredDomains      = 4096
+	maxConfiguredDNSUpstreams = 64
+	maxQueuedRequestBytes     = 256 << 20
+)
 
 type ServerConfigOverrides struct {
 	Values map[string]any
@@ -211,7 +217,7 @@ func loadServerConfigFile(filename string) (ServerConfig, error) {
 
 	switch format {
 	case configSourceJSON:
-		raw, err := os.ReadFile(path)
+		raw, err := readConfigFileLimited(path)
 		if err != nil {
 			return cfg, err
 		}
@@ -219,7 +225,15 @@ func loadServerConfigFile(filename string) (ServerConfig, error) {
 			return cfg, fmt.Errorf("parse JSON failed for %s: %w", path, err)
 		}
 	default:
-		if _, err := toml.DecodeFile(path, &cfg); err != nil {
+		raw, err := readConfigFileLimited(path)
+		if err != nil {
+			return cfg, err
+		}
+		meta, err := toml.Decode(string(raw), &cfg)
+		if err != nil {
+			return cfg, fmt.Errorf("parse TOML failed for %s: %w", path, err)
+		}
+		if err := rejectUnknownTOML(meta); err != nil {
 			return cfg, fmt.Errorf("parse TOML failed for %s: %w", path, err)
 		}
 	}
@@ -289,26 +303,21 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	if cfg.UDPHost == "" {
 		cfg.UDPHost = "0.0.0.0"
 	}
+	if net.ParseIP(cfg.UDPHost) == nil {
+		return cfg, fmt.Errorf("invalid UDP_HOST %q: must be an IP address", cfg.UDPHost)
+	}
 
 	if cfg.UDPPort <= 0 || cfg.UDPPort > 65535 {
 		return cfg, fmt.Errorf("invalid UDP_PORT: %d", cfg.UDPPort)
 	}
 
-	if cfg.UDPReaders <= 0 {
-		cfg.UDPReaders = defaultServerConfig().UDPReaders
-	}
+	cfg.UDPReaders = clampInt(defaultIntBelow(cfg.UDPReaders, 1, defaultServerConfig().UDPReaders), 1, 32)
 
-	if cfg.SocketBufferSize <= 0 {
-		cfg.SocketBufferSize = 8 * 1024 * 1024
-	}
+	cfg.SocketBufferSize = clampInt(defaultIntBelow(cfg.SocketBufferSize, 1, 8*1024*1024), 1, 256*1024*1024)
 
-	if cfg.MaxConcurrentRequests <= 0 {
-		cfg.MaxConcurrentRequests = 4096
-	}
+	cfg.MaxConcurrentRequests = clampInt(defaultIntBelow(cfg.MaxConcurrentRequests, 1, 4096), 1, 131072)
 
-	if cfg.DNSRequestWorkers <= 0 {
-		cfg.DNSRequestWorkers = defaultServerConfig().DNSRequestWorkers
-	}
+	cfg.DNSRequestWorkers = clampInt(defaultIntBelow(cfg.DNSRequestWorkers, 1, defaultServerConfig().DNSRequestWorkers), 1, 256)
 	if cfg.DeferredSessionWorkers < 0 {
 		cfg.DeferredSessionWorkers = 0
 	}
@@ -328,30 +337,21 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	if cfg.MaxPacketSize <= 0 {
 		cfg.MaxPacketSize = 65535
 	}
-
-	if cfg.DropLogIntervalSecs <= 0 {
-		cfg.DropLogIntervalSecs = 2.0
+	if cfg.MaxPacketSize < 512 || cfg.MaxPacketSize > 65535 {
+		return cfg, fmt.Errorf("invalid MAX_PACKET_SIZE %d: want 512..65535", cfg.MaxPacketSize)
 	}
 
-	if cfg.InvalidCookieWindowSecs <= 0 {
-		cfg.InvalidCookieWindowSecs = 2.0
-	}
+	cfg.DropLogIntervalSecs = clampFloat(defaultFloatAtMostZero(cfg.DropLogIntervalSecs, 2.0), 0.01, 86400.0)
+	cfg.InvalidCookieWindowSecs = clampFloat(defaultFloatAtMostZero(cfg.InvalidCookieWindowSecs, 2.0), 0.01, 86400.0)
 
 	if cfg.InvalidCookieErrorThreshold <= 0 {
 		cfg.InvalidCookieErrorThreshold = 10
 	}
+	cfg.InvalidCookieErrorThreshold = min(cfg.InvalidCookieErrorThreshold, 64)
 
-	if cfg.SessionTimeoutSecs <= 0 {
-		cfg.SessionTimeoutSecs = 300.0
-	}
-
-	if cfg.SessionCleanupIntervalSecs <= 0 {
-		cfg.SessionCleanupIntervalSecs = 30.0
-	}
-
-	if cfg.ClosedSessionRetentionSecs <= 0 {
-		cfg.ClosedSessionRetentionSecs = 600.0
-	}
+	cfg.SessionTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.SessionTimeoutSecs, 300.0), 1.0, 86400.0)
+	cfg.SessionCleanupIntervalSecs = clampFloat(defaultFloatAtMostZero(cfg.SessionCleanupIntervalSecs, 30.0), 0.1, 86400.0)
+	cfg.ClosedSessionRetentionSecs = clampFloat(defaultFloatAtMostZero(cfg.ClosedSessionRetentionSecs, 600.0), 1.0, 86400.0)
 
 	cfg.SessionInitReuseTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.SessionInitReuseTTLSeconds, 600.0), 1.0, 86400.0)
 	cfg.RecentlyClosedStreamTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.RecentlyClosedStreamTTLSeconds, 600.0), 1.0, 86400.0)
@@ -373,31 +373,28 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	if len(cfg.DNSUpstreamServers) == 0 {
 		cfg.DNSUpstreamServers = []string{"1.1.1.1:53"}
 	}
-
-	if cfg.DNSUpstreamTimeoutSecs <= 0 {
-		cfg.DNSUpstreamTimeoutSecs = 4.0
+	if len(cfg.DNSUpstreamServers) > maxConfiguredDNSUpstreams {
+		return cfg, fmt.Errorf("DNS_UPSTREAM_SERVERS count %d exceeds limit %d", len(cfg.DNSUpstreamServers), maxConfiguredDNSUpstreams)
 	}
+	upstreams, err := normalizeAndValidateDNSUpstreams(cfg.DNSUpstreamServers)
+	if err != nil {
+		return cfg, err
+	}
+	cfg.DNSUpstreamServers = upstreams
+
+	cfg.DNSUpstreamTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.DNSUpstreamTimeoutSecs, 4.0), 0.1, 120.0)
 	cfg.DNSInflightWaitTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.DNSInflightWaitTimeoutSecs, 15.0), 0.1, 120.0)
 
-	if cfg.SOCKSConnectTimeoutSecs <= 0 {
-		cfg.SOCKSConnectTimeoutSecs = 120.0
-	}
-
-	if cfg.DNSFragmentAssemblyTimeoutSecs <= 0 {
-		cfg.DNSFragmentAssemblyTimeoutSecs = 300.0
-	}
+	cfg.SOCKSConnectTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.SOCKSConnectTimeoutSecs, 120.0), 0.1, 3600.0)
+	cfg.DNSFragmentAssemblyTimeoutSecs = clampFloat(defaultFloatAtMostZero(cfg.DNSFragmentAssemblyTimeoutSecs, 300.0), 1.0, 86400.0)
 
 	cfg.StreamSetupAckTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.StreamSetupAckTTLSeconds, 400.0), 1.0, 86400.0)
 	cfg.StreamResultPacketTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.StreamResultPacketTTLSeconds, 300.0), 1.0, 86400.0)
 	cfg.StreamFailurePacketTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.StreamFailurePacketTTLSeconds, 120.0), 1.0, 86400.0)
 
-	if cfg.DNSCacheMaxRecords < 1 {
-		cfg.DNSCacheMaxRecords = 50000
-	}
+	cfg.DNSCacheMaxRecords = clampInt(defaultIntBelow(cfg.DNSCacheMaxRecords, 1, 50000), 1, 500000)
 
-	if cfg.DNSCacheTTLSeconds <= 0 {
-		cfg.DNSCacheTTLSeconds = 3600.0
-	}
+	cfg.DNSCacheTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.DNSCacheTTLSeconds, 3600.0), 1.0, 604800.0)
 
 	if cfg.ForwardPort < 0 || cfg.ForwardPort > 65535 {
 		return cfg, fmt.Errorf("invalid FORWARD_PORT: %d", cfg.ForwardPort)
@@ -427,12 +424,20 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	if cfg.MinVPNLabelLength <= 0 {
 		cfg.MinVPNLabelLength = 3
 	}
+	if len(cfg.Domain) > maxConfiguredDomains {
+		return cfg, fmt.Errorf("DOMAIN count %d exceeds limit %d", len(cfg.Domain), maxConfiguredDomains)
+	}
+	normalizedDomains, err := normalizeAndValidateDomains(cfg.Domain, "DOMAIN")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Domain = normalizedDomains
 
 	cfg.SupportedUploadCompressionTypes = normalizeCompressionTypeList(cfg.SupportedUploadCompressionTypes)
 	cfg.SupportedDownloadCompressionTypes = normalizeCompressionTypeList(cfg.SupportedDownloadCompressionTypes)
 
 	if cfg.DataEncryptionMethod < 0 || cfg.DataEncryptionMethod > 5 {
-		cfg.DataEncryptionMethod = 1
+		return cfg, fmt.Errorf("invalid DATA_ENCRYPTION_METHOD: %d", cfg.DataEncryptionMethod)
 	}
 
 	if cfg.EncryptionKeyFile == "" {
@@ -476,8 +481,109 @@ func finalizeServerConfig(cfg ServerConfig) (ServerConfig, error) {
 	return cfg, nil
 }
 
+func normalizeAndValidateDomains(domains []string, field string) ([]string, error) {
+	if len(domains) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(domains))
+	normalized := make([]string, 0, len(domains))
+	for _, raw := range domains {
+		domain := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(raw)), ".")
+		if err := validateConfiguredDomain(domain); err != nil {
+			return nil, fmt.Errorf("invalid %s value %q: %w", field, raw, err)
+		}
+		if _, duplicate := seen[domain]; duplicate {
+			continue
+		}
+		seen[domain] = struct{}{}
+		normalized = append(normalized, domain)
+	}
+	return normalized, nil
+}
+
+func validateConfiguredDomain(domain string) error {
+	if domain == "" || len(domain) > 253 || !strings.Contains(domain, ".") {
+		return fmt.Errorf("must be a multi-label DNS domain")
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("contains an invalid label")
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return fmt.Errorf("contains a non-DNS character")
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeAndValidateDNSUpstreams(upstreams []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(upstreams))
+	normalized := make([]string, 0, len(upstreams))
+	for _, raw := range upstreams {
+		endpoint := strings.TrimSpace(raw)
+		host, port := endpoint, "53"
+		switch {
+		case endpoint == "":
+			return nil, fmt.Errorf("DNS_UPSTREAM_SERVERS contains an empty endpoint")
+		case strings.HasPrefix(endpoint, "[") || strings.Count(endpoint, ":") == 1:
+			var err error
+			host, port, err = net.SplitHostPort(endpoint)
+			if err != nil {
+				return nil, fmt.Errorf("invalid DNS upstream %q: %w", raw, err)
+			}
+		case strings.Count(endpoint, ":") > 1:
+			if net.ParseIP(endpoint) == nil {
+				return nil, fmt.Errorf("invalid DNS upstream %q", raw)
+			}
+		}
+		if strings.TrimSpace(host) == "" {
+			return nil, fmt.Errorf("invalid DNS upstream %q: host is required", raw)
+		}
+		normalizedHost, hostErr := normalizeAndValidateEndpointHost(host)
+		if hostErr != nil {
+			return nil, fmt.Errorf("invalid DNS upstream %q: %w", raw, hostErr)
+		}
+		host = normalizedHost
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return nil, fmt.Errorf("invalid DNS upstream %q: port must be in 1..65535", raw)
+		}
+		canonical := net.JoinHostPort(host, strconv.Itoa(portNumber))
+		if _, duplicate := seen[canonical]; duplicate {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		normalized = append(normalized, canonical)
+	}
+	return normalized, nil
+}
+
+func normalizeAndValidateEndpointHost(host string) (string, error) {
+	host = strings.TrimSpace(host)
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.String(), nil
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	if host == "" || len(host) > 253 {
+		return "", fmt.Errorf("invalid host")
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", fmt.Errorf("invalid host label")
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return "", fmt.Errorf("invalid host character")
+			}
+		}
+	}
+	return host, nil
+}
+
 func (c ServerConfig) Address() string {
-	return fmt.Sprintf("%s:%d", c.UDPHost, c.UDPPort)
+	return net.JoinHostPort(c.UDPHost, strconv.Itoa(c.UDPPort))
 }
 
 func (c ServerConfig) DropLogInterval() time.Duration {
@@ -587,6 +693,12 @@ func (c ServerConfig) EffectiveDeferredSessionQueueLimit() int {
 func (c ServerConfig) EffectiveMaxConcurrentRequests() int {
 	recommended := max(c.EffectiveUDPReaders()*c.EffectiveDNSRequestWorkers()*512, 4096)
 	return clampInt(max(c.MaxConcurrentRequests, recommended), 1024, 131072)
+}
+
+func (c ServerConfig) EffectiveRequestQueueCapacity() int {
+	maxPacketSize := max(c.MaxPacketSize, 1)
+	byteBoundCapacity := maxQueuedRequestBytes / maxPacketSize
+	return max(min(c.EffectiveMaxConcurrentRequests(), byteBoundCapacity), 1)
 }
 
 func (c ServerConfig) EffectiveMaxPacketsPerBatch() int {

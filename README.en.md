@@ -22,10 +22,15 @@ The admin creates "instances" (a **domain + encryption key** pair) and hands the
 
 ## Install
 
-Ubuntu / Debian VPS, as root:
+Privileged installation requires an audited full commit SHA. Download and
+inspect the installer first; do not pipe mutable branch content into a root
+shell:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
+git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
+cd masterdns-zanoza-panel
+git checkout --detach <AUDITED_FULL_COMMIT_SHA>
+sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
 ```
 
 The installer (3x-ui style) asks for:
@@ -36,6 +41,10 @@ The installer (3x-ui style) asks for:
    - **1) IP certificate** — self-signed for the server IP, 6-day validity, auto-renewed via a systemd timer.
    - **2) Domain certificate** via Let's Encrypt — needs an A record `panel.example.com` → server IP.
    - **3) No certificate** — the panel listens **only** on `127.0.0.1` (expose via nginx / SSH tunnel).
+
+For a TLS-terminating reverse proxy, set `ZANOZA_EXTERNAL_ORIGIN` to the exact
+public origin and `ZANOZA_TRUSTED_PROXIES` to the proxy IP/CIDR during install.
+Only trusted peers' `X-Forwarded-For` headers are used for login rate limiting.
 
 After install it generates a **10-char login** and **20-char password** and prints the full panel URL:
 `https://IP:PORT/admin`, `https://panel.example.com:PORT/admin`, or `http://127.0.0.1:PORT/admin`.
@@ -86,8 +95,10 @@ All variables are optional; the panel works without them using defaults.
 
 | Variable | Purpose | Default |
 |---|---|---|
-| `ZANOZA_CONFIG` | Path to the panel JSON config | `/etc/zanoza-panel/config.json` |
+| `ZANOZA_CONFIG` | Path to the panel JSON config | `/var/lib/zanoza-panel/config.json` |
 | `ZANOZA_RUNTIME_DIR` | Directory for keyring.json + server_config.toml | `<configDir>/masterdns` |
+| `ZANOZA_EXTERNAL_ORIGIN` | Exact public proxy origin, e.g. `https://panel.example` | empty |
+| `ZANOZA_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs/CIDRs | empty |
 | `ZANOZA_PANEL_ADDR` | HTTP listen address | from `config.json` |
 | `ZANOZA_PANEL_PORT` | Panel port (1–65535) | from `config.json` |
 | `ZANOZA_PANEL_PATH` | Admin URL path (e.g. `/secret`) | from `config.json` |

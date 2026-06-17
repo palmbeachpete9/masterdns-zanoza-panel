@@ -1,9 +1,5 @@
 name: CI
 
-# NOTE: third-party actions below are referenced by major tag. They should be
-# pinned to immutable commit SHAs (managed by Dependabot) for full supply-chain
-# integrity (V4-05/V4-08); the distro shellcheck already avoids a mutable action.
-
 on:
   push:
     branches: [main]
@@ -14,7 +10,7 @@ permissions:
 
 env:
   # Security patch floor (N01): must be >= the latest fixed stdlib patch level.
-  GO_VERSION: "1.25.11"
+  GO_VERSION: "1.26.4"
   # Pinned tool versions for reproducible CI (R-08).
   GOVULNCHECK_VERSION: "v1.1.4"
 
@@ -23,8 +19,8 @@ jobs:
     name: Panel (root module)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -42,8 +38,8 @@ jobs:
       run:
         working-directory: masterdns
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -58,8 +54,10 @@ jobs:
     name: golangci-lint + gofumpt (both modules)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -70,31 +68,21 @@ jobs:
           "$RUNNER_TEMP/golangci-lint" run ./...
       - name: gofumpt root + nested (enforced)
         run: |
-          out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools masterdns/internal masterdns/cmd)"
+          out="$(go run mvdan.cc/gofumpt -l -extra ./cmd ./tools masterdns/internal masterdns/cmd masterdns/scripts/bench)"
           if [ -n "$out" ]; then echo "Unformatted files:"; echo "$out"; exit 1; fi
-      # The full nested-module run reports a reviewed baseline of legacy upstream
-      # findings (tracked, non-blocking).
-      - name: lint nested module (informational baseline)
-        continue-on-error: true
+      - name: lint nested module
         working-directory: masterdns
         run: |
           "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml ./...
-      # ENFORCED on PRs: zero NEW nested-module findings relative to the base
-      # branch. Regressions of the same classes now block the merge (R-10/V4-09).
-      - name: lint nested module (enforce no new issues)
-        if: github.event_name == 'pull_request'
-        working-directory: masterdns
-        run: |
-          "$RUNNER_TEMP/golangci-lint" run -c ../.golangci.yml --new-from-merge-base "origin/${{ github.base_ref }}" ./...
 
   frontend:
     name: Frontend build + typecheck + audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: "20"
+          node-version: "20.19.0"
           cache: npm
       - run: npm ci
       - run: npx tsc --noEmit
@@ -102,21 +90,31 @@ jobs:
       # Generated assets must be clean after a build — no stale/duplicate
       # embedded files (R-11).
       - name: assert generated assets are clean
-        run: git diff --exit-code -- cmd/zanoza-panel/web/dist
+        run: |
+          status="$(git status --porcelain=v1 --untracked-files=all -- cmd/zanoza-panel/web/dist)"
+          [ -z "$status" ] || { echo "$status"; exit 1; }
       # Production dependencies must have zero vulnerabilities (enforced, N03).
       - run: npm audit --omit=dev --audit-level=low
-      # Dev tooling: ENFORCE no high/critical advisories. The only currently
-      # accepted exceptions are two *moderate*, dev-server-only Vite/esbuild
-      # advisories (not reachable in the shipped panel, which embeds a static
-      # build). Review/upgrade target: next Vite major bump (V4-09).
-      - run: npm audit --audit-level=high
+      # Dev tooling must also have zero known advisories.
+      - run: npm audit --audit-level=low
 
   shell:
     name: Shell syntax + ShellCheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       # Use the distro shellcheck instead of a mutable third-party action (F27).
       - run: sudo apt-get update && sudo apt-get install -y shellcheck
-      - run: bash -n scripts/install.sh scripts/zanoza
-      - run: shellcheck --severity=warning scripts/install.sh scripts/zanoza
+      - run: bash -n scripts/install.sh scripts/zanoza masterdns/server_linux_install.sh masterdns/docker/*.sh
+      - run: shellcheck --severity=warning scripts/install.sh scripts/zanoza masterdns/server_linux_install.sh masterdns/docker/*.sh
+      - name: supply-chain policy
+        run: |
+          bad_actions="$(grep -R --line-number -E 'uses:[[:space:]]+[^#[:space:]]+@' .github/workflows | grep -Ev '@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)"
+          [ -z "$bad_actions" ] || { echo "Unpinned actions:"; echo "$bad_actions"; exit 1; }
+          ! grep -R --line-number -E 'RELEASE_TAG:-latest|raw.githubusercontent.com/.*/main/.+ \| sudo bash' scripts masterdns/docker README.en.md README.md
+          ! grep -R --line-number -E '^FROM[[:space:]]+[^@[:space:]]+([[:space:]]+AS[[:space:]]+.*)?$' masterdns/docker/Dockerfile
+          grep -q 'sed -n.*"digest"' scripts/install.sh
+          ! grep -q 'install -d -o "\$SVC_USER".*"\$STATE_DIR/masterdns"' scripts/install.sh
+          grep -q 'remote set-url origin "\$REPO"' scripts/install.sh
+          grep -q 'source directory is non-empty but is not a git repository' scripts/install.sh
+          for arch in AMD64 ARM64 ARMV5 ARMV7 MIPS64LE; do grep -q "RELEASE_SHA256_${arch}" masterdns/docker/Dockerfile; done

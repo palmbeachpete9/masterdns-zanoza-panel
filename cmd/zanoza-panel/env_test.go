@@ -2,6 +2,7 @@ package main
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -26,7 +27,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Setenv(EnvName, "test-server")
 
 		cfg := &Config{PanelAddr: "0.0.0.0", PanelPath: "/admin", Name: "Default"}
-		applyEnvOverrides(cfg)
+		require.NoError(t, applyEnvOverrides(cfg))
 
 		assert.Equal(t, "10.0.0.1", cfg.PanelAddr)
 		assert.Equal(t, "/secret", cfg.PanelPath)
@@ -49,9 +50,22 @@ func TestApplyEnvOverrides(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(EnvPanelPort, tt.env)
 			cfg := &Config{PanelPort: tt.initial}
-			applyEnvOverrides(cfg)
-			assert.Equal(t, tt.expected, cfg.PanelPort)
+			err := applyEnvOverrides(cfg)
+			if tt.name == "valid" {
+				require.NoError(t, err)
+				assert.Equal(t, tt.expected, cfg.PanelPort)
+			} else {
+				require.Error(t, err)
+				assert.Equal(t, tt.initial, cfg.PanelPort)
+			}
 		})
+	}
+}
+
+func TestEnvironmentWithoutRemovesBootstrapPassword(t *testing.T) {
+	got := environmentWithout([]string{"KEEP=value", EnvPassword + "=secret", "EMPTY="}, EnvPassword)
+	if strings.Join(got, ",") != "KEEP=value,EMPTY=" {
+		t.Fatalf("filtered environment = %v", got)
 	}
 }
 

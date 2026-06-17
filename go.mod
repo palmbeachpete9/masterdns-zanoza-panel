@@ -2,6 +2,8 @@ module github.com/palmbeachpete9/masterdns-zanoza-panel
 
 go 1.25.0
 
+toolchain go1.26.4
+
 require (
 	github.com/golangci/golangci-lint/v2 v2.12.2
 	mvdan.cc/gofumpt v0.10.0

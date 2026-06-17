@@ -162,10 +162,11 @@ Shorter domain names leave more space for actual data inside each DNS request. F
 
 #### Step 1.2.1: Automatic Installation (Script)
 
-If you want to deploy the server on Linux, the easiest method is the automatic installer script. Run this command on the server:
+Download and inspect the installer, then provide an immutable release tag and
+the published SHA-256 for the selected ZIP:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh)
+bash server_linux_install.sh --version <RELEASE_TAG> --sha256 <RELEASE_ZIP_SHA256>
 ```
 
 The script handles installation and configuration automatically. When it finishes, the server starts and the **encryption key** is shown in the terminal log and also written to `encrypt_key.txt` next to the executable. Keep this key safe.
@@ -301,7 +302,7 @@ docker run -d \
   -v $(pwd)/data:/data \
   -p 53:53/tcp \
   -p 53:53/udp \
-  ghcr.io/masterking32/masterdnsvpn:latest
+  ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST>
 ```
 
 ---
@@ -311,7 +312,7 @@ docker run -d \
 ```yaml
 services:
   masterdnsvpn:
-    image: ghcr.io/masterking32/masterdnsvpn:latest
+    image: ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST>
     restart: unless-stopped
     environment:
       - DOMAIN=v.example.com
@@ -366,7 +367,7 @@ add dst=/data list=MasterDnsVPN src=/containers/mounts/MasterDnsVPN
 /container envs
 add key=DOMAIN list=MasterDnsVPN value=v.example.com
 
-/container add check-certificate=no dns=1.1.1.1 envlists=MasterDnsVPN hostname=MasterDnsVPN interface=MasterDnsVPN layer-dir="" mountlists=MasterDnsVPN name=MasterDnsVPN remote-image=ghcr.io/masterking32/masterdnsvpn:latest root-dir=/containers/data/MasterDnsVPN start-on-boot=yes
+/container add check-certificate=no dns=1.1.1.1 envlists=MasterDnsVPN hostname=MasterDnsVPN interface=MasterDnsVPN layer-dir="" mountlists=MasterDnsVPN name=MasterDnsVPN remote-image=ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST> root-dir=/containers/data/MasterDnsVPN start-on-boot=yes
 ```
 
 ---

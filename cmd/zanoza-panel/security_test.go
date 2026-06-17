@@ -99,6 +99,15 @@ func TestCredentialsBcryptAndMigration(t *testing.T) {
 	}
 }
 
+func TestCredentialPasswordStdinIsBounded(t *testing.T) {
+	if got, err := readCredentialPassword(strings.NewReader("longenough1")); err != nil || got != "longenough1" {
+		t.Fatalf("readCredentialPassword valid input = %q, %v", got, err)
+	}
+	if _, err := readCredentialPassword(strings.NewReader(strings.Repeat("x", maxPasswordLen+1))); err == nil {
+		t.Fatal("oversized stdin password was accepted")
+	}
+}
+
 // F07 — password policy + username validation (F24).
 func TestCredentialPolicy(t *testing.T) {
 	c := loadCredentials(filepath.Join(t.TempDir(), "panel.env"))
@@ -234,6 +243,25 @@ func TestReadJSONLimits(t *testing.T) {
 	r2 := httptest.NewRequest("POST", "/", strings.NewReader(`{"a":1}{"b":2}`))
 	if err := readJSON(httptest.NewRecorder(), r2, &struct{ A int }{}); err == nil {
 		t.Fatal("trailing JSON accepted")
+	}
+
+	r3 := httptest.NewRequest("POST", "/", strings.NewReader(`{"a":1}]`))
+	if err := readJSON(httptest.NewRecorder(), r3, &struct{ A int }{}); err == nil {
+		t.Fatal("malformed trailing token accepted")
+	}
+
+	for name, body := range map[string]string{
+		"unknown field":             `{"a":1,"typo":2}`,
+		"duplicate key":             `{"a":1,"a":2}`,
+		"case-folded duplicate key": `{"a":1,"A":2}`,
+		"non-object":                `null`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := httptest.NewRequest("POST", "/", strings.NewReader(body))
+			if err := readJSON(httptest.NewRecorder(), r, &struct{ A int }{}); err == nil {
+				t.Fatalf("%s accepted", name)
+			}
+		})
 	}
 }
 

@@ -15,6 +15,7 @@ import (
 
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/compression"
+
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	Enums "masterdnsvpn-go/internal/enums"
@@ -506,7 +507,7 @@ func (s *Server) packControlBlocks(record *sessionRecord, first *serverStreamTXP
 	}
 
 	var initialStream *Stream_server
-	var initialIndex int = -1
+	initialIndex := -1
 	if initialID != -1 {
 		for i, id := range readyIDs {
 			if id == initialID {
@@ -805,8 +806,9 @@ func (s *Server) handleMTUDownRequest(questionPacket []byte, _ DnsParser.LitePac
 		return nil
 	}
 
-	payloadBuffer := s.mtuProbePayloadPool.Get().([]byte)
-	defer s.mtuProbePayloadPool.Put(payloadBuffer)
+	payloadBufferPtr := s.mtuProbePayloadPool.Get().(*[]byte)
+	defer s.mtuProbePayloadPool.Put(payloadBufferPtr)
+	payloadBuffer := *payloadBufferPtr
 	payload := payloadBuffer[:downloadSize]
 	copy(payload[:mtuProbeCodeLength], vpnPacket.Payload[1:mtuProbeUpMinSize])
 	binary.BigEndian.PutUint16(payload[mtuProbeCodeLength:], uint16(downloadSize))

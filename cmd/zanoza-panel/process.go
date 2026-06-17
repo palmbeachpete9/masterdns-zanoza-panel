@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,8 +27,14 @@ type keyringEntry struct {
 }
 
 type keyringFile struct {
-	Version   int            `json:"version"`
-	Instances []keyringEntry `json:"instances"`
+	Version    int            `json:"version"`
+	Generation uint64         `json:"generation"`
+	Instances  []keyringEntry `json:"instances"`
+}
+
+type appliedMarker struct {
+	Digest     string `json:"digest"`
+	Generation uint64 `json:"generation"`
 }
 
 // RuntimeState is reported to the UI.
@@ -71,10 +78,17 @@ type serverManager struct {
 	restarts      int       // auto-restarts within the current crash window
 	windowAt      time.Time // start of the current crash-loop window
 	desiredDigest string    // sha256 of the keyring the panel last wrote (R-03)
+	desiredGen    uint64    // monotonically identifies the current apply attempt
 	desiredAt     time.Time // when desiredDigest was published (apply timeout, V4-06)
+	restartDelay  time.Duration
 }
 
 const applyAckTimeout = 15 * time.Second
+
+const (
+	maxAppliedMarkerBytes = 4 << 10
+	maxKeyringFileBytes   = 32 << 20
+)
 
 // recordApplyErr stores an apply-stage failure in runtime state and returns it,
 // so the state endpoint can surface the actual error (V4-06).
@@ -86,28 +100,40 @@ func (m *serverManager) recordApplyErr(err error) error {
 }
 
 const (
-	crashWindow    = 60 * time.Second
-	maxRestarts    = 5
-	restartBackoff = 2 * time.Second
+	crashWindow         = 60 * time.Second
+	maxRestarts         = 5
+	defaultRestartDelay = 2 * time.Second
+	stopGraceTimeout    = 8 * time.Second
+	stopKillTimeout     = 2 * time.Second
 )
 
 func newServerManager(runtimeDir string) *serverManager {
 	bin := envDefault(EnvMasterdnsBin, "/usr/local/bin/masterdns-server")
-	return &serverManager{
-		binary:      bin,
-		runtimeDir:  runtimeDir,
-		keyringPath: filepath.Join(runtimeDir, "keyring.json"),
-		configPath:  filepath.Join(runtimeDir, "server_config.toml"),
+	m := &serverManager{
+		binary:       bin,
+		runtimeDir:   runtimeDir,
+		keyringPath:  filepath.Join(runtimeDir, "keyring.json"),
+		configPath:   filepath.Join(runtimeDir, "server_config.toml"),
+		restartDelay: defaultRestartDelay,
 	}
+	m.desiredGen = readGenerationWatermark(m.keyringPath)
+	return m
 }
 
 // writeKeyring renders keyring.json + a base server_config.toml from the
 // current instances and records the content digest the panel desires (R-03).
 func (m *serverManager) writeKeyring(instances []Instance) error {
-	if err := os.MkdirAll(m.runtimeDir, 0o755); err != nil {
+	if err := os.MkdirAll(m.runtimeDir, 0o700); err != nil {
 		return m.recordApplyErr(err)
 	}
-	kf := keyringFile{Version: 1}
+	m.mu.Lock()
+	if m.desiredGen == math.MaxUint64 {
+		m.mu.Unlock()
+		return m.recordApplyErr(fmt.Errorf("keyring generation exhausted"))
+	}
+	generation := m.desiredGen + 1
+	m.mu.Unlock()
+	kf := keyringFile{Version: 1, Generation: generation}
 	for _, ins := range instances {
 		kf.Instances = append(kf.Instances, keyringEntry{
 			Domain: ins.Domain,
@@ -118,6 +144,9 @@ func (m *serverManager) writeKeyring(instances []Instance) error {
 	raw, err := json.MarshalIndent(kf, "", "  ")
 	if err != nil {
 		return m.recordApplyErr(err)
+	}
+	if len(raw) > maxKeyringFileBytes {
+		return m.recordApplyErr(fmt.Errorf("serialized keyring exceeds the %d-byte size limit", maxKeyringFileBytes))
 	}
 	// digest of the exact bytes we are about to write; the server writes the
 	// same digest to keyring.json.applied after it loads them (R-03).
@@ -136,6 +165,7 @@ func (m *serverManager) writeKeyring(instances []Instance) error {
 	// (V4-06).
 	m.mu.Lock()
 	m.desiredDigest = digest
+	m.desiredGen = generation
 	m.desiredAt = time.Now()
 	m.lastApplyErr = ""
 	m.mu.Unlock()
@@ -146,8 +176,15 @@ func (m *serverManager) writeKeyring(instances []Instance) error {
 // server at keyring.json. The server derives DOMAIN + per-domain codecs
 // from the keyring, so the panel only manages keyring.json afterwards.
 func (m *serverManager) ensureServerConfig() error {
-	if _, err := os.Stat(m.configPath); err == nil {
+	info, err := os.Lstat(m.configPath)
+	if err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("%s must be a regular non-symlink file", m.configPath)
+		}
 		return nil // keep admin-tuned config
+	}
+	if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect server config %s: %w", m.configPath, err)
 	}
 	dnsHost := envDefault(EnvDNSHost, "0.0.0.0")
 	dnsPort := "53"
@@ -195,8 +232,7 @@ func (m *serverManager) apply(instances []Instance) error {
 
 	if len(instances) == 0 {
 		// Nothing to serve; stop the process if it's up.
-		m.stop()
-		return nil
+		return m.stop()
 	}
 
 	m.mu.Lock()
@@ -235,6 +271,7 @@ func (m *serverManager) startLocked() error {
 		return fmt.Errorf("%s", m.lastApplyErr)
 	}
 	cmd := exec.Command(m.binary, "-config", m.configPath)
+	cmd.Env = environmentWithout(os.Environ(), EnvPassword)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
@@ -251,6 +288,21 @@ func (m *serverManager) startLocked() error {
 	m.desiredUp = true
 	go m.reap(cmd, done)
 	return nil
+}
+
+func environmentWithout(environment []string, keys ...string) []string {
+	blocked := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		blocked[key] = struct{}{}
+	}
+	filtered := make([]string, 0, len(environment))
+	for _, item := range environment {
+		key, _, _ := strings.Cut(item, "=")
+		if _, remove := blocked[key]; !remove {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 // reap is the single owner of cmd.Wait() for one process generation. On an
@@ -291,7 +343,7 @@ func (m *serverManager) reap(cmd *exec.Cmd, done chan struct{}) {
 		} else {
 			restart = true
 			attempt = m.restarts
-			backoff = time.Duration(m.restarts) * restartBackoff
+			backoff = m.restartBackoffLocked(m.restarts)
 		}
 	}
 	m.mu.Unlock()
@@ -308,20 +360,65 @@ func (m *serverManager) reap(cmd *exec.Cmd, done chan struct{}) {
 		return
 	}
 	log.Printf("masterdns exited (%v); auto-restart in %s (attempt %d/%d)", err, backoff, attempt, maxRestarts)
+	m.scheduleAutoRestart(err, backoff)
+}
+
+func (m *serverManager) restartBackoffLocked(attempt int) time.Duration {
+	delay := m.restartDelay
+	if delay <= 0 {
+		delay = defaultRestartDelay
+	}
+	return time.Duration(attempt) * delay
+}
+
+// scheduleAutoRestart keeps retrying launch failures within the same bounded
+// crash-loop budget. A failed exec previously had no process to reap, so one
+// transient launch failure silently ended supervision while desiredUp stayed
+// true forever.
+func (m *serverManager) scheduleAutoRestart(exitErr error, backoff time.Duration) {
 	go func() {
-		time.Sleep(backoff)
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		if !m.desiredUp || m.cmd != nil {
-			return
-		}
-		if err := m.startLocked(); err != nil {
-			log.Printf("masterdns auto-restart failed: %v", err)
+		for {
+			time.Sleep(backoff)
+
+			m.mu.Lock()
+			if !m.desiredUp || m.cmd != nil {
+				m.mu.Unlock()
+				return
+			}
+			err := m.startLocked()
+			if err == nil {
+				m.mu.Unlock()
+				return
+			}
+
+			now := time.Now()
+			if now.Sub(m.windowAt) > crashWindow {
+				m.windowAt = now
+				m.restarts = 0
+			}
+			m.restarts++
+			attempt := m.restarts
+			if attempt > maxRestarts {
+				msg := fmt.Sprintf("masterdns restart launch loop: %d attempts within %s; supervisor stopped after %v", attempt, crashWindow, err)
+				m.lastApplyErr = msg
+				m.desiredUp = false
+				m.mu.Unlock()
+				log.Printf("masterdns: %s", msg)
+				return
+			}
+			backoff = m.restartBackoffLocked(attempt)
+			m.mu.Unlock()
+
+			log.Printf("masterdns auto-restart launch failed after exit (%v): %v; retry in %s (attempt %d/%d)", exitErr, err, backoff, attempt, maxRestarts)
 		}
 	}()
 }
 
-func (m *serverManager) stop() {
+func (m *serverManager) stop() error {
+	return m.stopWithTimeout(stopGraceTimeout, stopKillTimeout)
+}
+
+func (m *serverManager) stopWithTimeout(graceTimeout, killTimeout time.Duration) error {
 	m.mu.Lock()
 	m.desiredUp = false
 	cmd := m.cmd
@@ -329,26 +426,54 @@ func (m *serverManager) stop() {
 	done := m.done
 	m.mu.Unlock()
 	if cmd == nil || pid == 0 {
-		return
+		return nil
 	}
-	_ = syscall.Kill(pid, syscall.SIGTERM)
 	if done == nil {
-		return
+		err := fmt.Errorf("masterdns stop cannot wait for pid %d: missing process completion channel", pid)
+		return m.recordApplyErr(err)
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		select {
+		case <-done:
+			return nil
+		default:
+		}
+		stopErr := fmt.Errorf("masterdns stop failed to signal pid %d: %w", pid, err)
+		return m.recordApplyErr(stopErr)
 	}
 	// Wait for reap (the sole cmd.Wait owner) to observe the exit. No second
 	// Wait is ever issued, avoiding the previous double-Wait race (F09).
 	select {
 	case <-done:
-	case <-time.After(8 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
+		return nil
+	case <-time.After(graceTimeout):
 	}
+
+	var killErr error
+	if cmd.Process == nil {
+		killErr = fmt.Errorf("missing process handle")
+	} else {
+		killErr = cmd.Process.Kill()
+	}
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(killTimeout):
+	}
+
+	if killErr != nil {
+		return m.recordApplyErr(fmt.Errorf("masterdns stop timed out after SIGTERM and failed to kill pid %d: %w", pid, killErr))
+	}
+	return m.recordApplyErr(fmt.Errorf("masterdns stop timed out waiting for pid %d after SIGTERM and kill", pid))
 }
 
 func (m *serverManager) restart(instances []Instance) error {
 	m.applyMu.Lock()
 	defer m.applyMu.Unlock()
-	m.stop()
+	if err := m.stop(); err != nil {
+		return err
+	}
 	if len(instances) == 0 {
 		return nil
 	}
@@ -382,10 +507,11 @@ func (m *serverManager) state() RuntimeState {
 	// Content-bound desired vs applied (R-03): the panel knows the digest it
 	// wrote; the running server records the digest it actually loaded. A missing
 	// or mismatched marker is treated as NOT applied (never as a false success).
-	applied := readAppliedDigest(m.keyringPath)
+	applied := readAppliedMarker(m.keyringPath)
 	st.DesiredKeyring = m.desiredDigest
-	st.AppliedKeyring = applied
-	acknowledged := m.desiredDigest != "" && applied == m.desiredDigest
+	st.AppliedKeyring = applied.Digest
+	acknowledged := st.Running && m.desiredDigest != "" &&
+		applied.Digest == m.desiredDigest && applied.Generation == m.desiredGen
 	st.ApplyPending = st.Running && !acknowledged
 
 	switch {
@@ -410,12 +536,44 @@ func (m *serverManager) state() RuntimeState {
 // readAppliedDigest reads the content digest the MasterDNS server acknowledged
 // loading (written next to keyring.json). Returns "" (unacknowledged) if the
 // marker is absent or unreadable — never a value that could look applied (R-03).
-func readAppliedDigest(keyringPath string) string {
-	raw, err := os.ReadFile(keyringPath + ".applied")
+func readAppliedMarker(keyringPath string) appliedMarker {
+	raw, err := readFileLimited(keyringPath+".applied", maxAppliedMarkerBytes)
 	if err != nil {
-		return ""
+		return appliedMarker{}
 	}
-	return strings.TrimSpace(string(raw))
+	var marker appliedMarker
+	if decodeStrictJSONObject(raw, &marker) != nil || marker.Digest == "" || marker.Generation == 0 {
+		return appliedMarker{}
+	}
+	return marker
+}
+
+// readGenerationWatermark prevents generation reuse after a panel restart.
+// Reusing an old generation with identical instance content would recreate the
+// same digest and let a stale applied marker look current before MasterDNS had
+// actually reloaded the new write.
+func readGenerationWatermark(keyringPath string) uint64 {
+	var watermark uint64
+	var keyringDigest string
+	if raw, err := readFileLimited(keyringPath, maxKeyringFileBytes); err == nil {
+		var persisted keyringFile
+		if decodeStrictJSONObject(raw, &persisted) == nil && persisted.Version == 1 {
+			watermark = persisted.Generation
+			sum := sha256.Sum256(raw)
+			keyringDigest = hex.EncodeToString(sum[:])
+		}
+	}
+	// Trust a newer service-written marker only when it acknowledges the exact
+	// persisted keyring. Otherwise stale/corrupt state (including MaxUint64)
+	// could permanently prevent every future apply.
+	if marker := readAppliedMarker(keyringPath); marker.Digest == keyringDigest && marker.Generation > watermark {
+		watermark = marker.Generation
+	}
+	return watermark
+}
+
+func readAppliedDigest(keyringPath string) string {
+	return readAppliedMarker(keyringPath).Digest
 }
 
 // processMemoryBytes reads RSS from /proc on Linux; best-effort elsewhere.

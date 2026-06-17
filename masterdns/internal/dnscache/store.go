@@ -32,8 +32,12 @@ const (
 )
 
 const (
-	shardCount = 32
-	shardMask  = shardCount - 1
+	shardCount              = 32
+	shardMask               = shardCount - 1
+	minCacheByteBudget      = 1 << 20
+	maxCacheByteBudget      = 256 << 20
+	estimatedBytesPerRecord = 4 << 10
+	maxCacheRecords         = 500000
 )
 
 type Entry struct {
@@ -68,17 +72,23 @@ type shard struct {
 }
 
 type Store struct {
-	maxRecords     int
-	cacheTTL       time.Duration
-	pendingTimeout time.Duration
-	shards         [shardCount]shard
-	pendingTotal   atomic.Uint64
-	dirty          atomic.Uint64 // used as a flag/counter
+	maxRecords       int
+	cacheTTL         time.Duration
+	pendingTimeout   time.Duration
+	shards           [shardCount]shard
+	pendingTotal     atomic.Uint64
+	responseBytes    atomic.Int64
+	maxResponseBytes int64
+	dirty            atomic.Uint64 // used as a flag/counter
+	persistMu        sync.Mutex    // serializes durable load/save transactions
 }
 
 func New(maxRecords int, cacheTTL, pendingTimeout time.Duration) *Store {
 	if maxRecords < 1 {
 		maxRecords = 1
+	}
+	if maxRecords > maxCacheRecords {
+		maxRecords = maxCacheRecords
 	}
 	if cacheTTL <= 0 {
 		cacheTTL = time.Hour
@@ -87,15 +97,24 @@ func New(maxRecords int, cacheTTL, pendingTimeout time.Duration) *Store {
 		pendingTimeout = 30 * time.Second
 	}
 	s := &Store{
-		maxRecords:     maxRecords,
-		cacheTTL:       cacheTTL,
-		pendingTimeout: pendingTimeout,
+		maxRecords:       maxRecords,
+		cacheTTL:         cacheTTL,
+		pendingTimeout:   pendingTimeout,
+		maxResponseBytes: cacheByteBudget(maxRecords),
 	}
 	for i := 0; i < shardCount; i++ {
-		s.shards[i].items = make(map[string]*list.Element, maxRecords/shardCount+1)
+		s.shards[i].items = make(map[string]*list.Element, min(maxRecords/shardCount+1, 1024))
 		s.shards[i].order = list.New()
 	}
 	return s
+}
+
+func cacheByteBudget(maxRecords int) int64 {
+	records := int64(maxRecords)
+	if records > maxCacheByteBudget/estimatedBytesPerRecord {
+		return maxCacheByteBudget
+	}
+	return max(records*estimatedBytesPerRecord, int64(minCacheByteBudget))
 }
 
 func BuildKey(domain string, qType, qClass uint16) string {
@@ -284,6 +303,16 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 
 	if element, ok := shard.items[key]; ok {
 		node := element.Value.(*cacheNode)
+		oldResponseBytes := len(node.entry.Response)
+		delta := int64(len(normalized) - oldResponseBytes)
+		if delta > 0 && s.responseBytes.Add(delta) > s.maxResponseBytes {
+			s.responseBytes.Add(-delta)
+			s.removeElementLocked(shard, element)
+			return
+		}
+		if delta < 0 {
+			s.responseBytes.Add(delta)
+		}
 		if node.entry.Status == StatusPending {
 			if count := s.pendingTotal.Load(); count > 0 {
 				s.pendingTotal.Add(^uint64(0)) // Decrement
@@ -302,6 +331,11 @@ func (s *Store) SetReady(key, domain string, qType, qClass uint16, rawResponse [
 		return
 	}
 
+	responseBytes := int64(len(normalized))
+	if s.responseBytes.Add(responseBytes) > s.maxResponseBytes {
+		s.responseBytes.Add(-responseBytes)
+		return
+	}
 	entry := Entry{
 		Domain:        domain,
 		QuestionType:  qType,
@@ -407,6 +441,9 @@ func (s *Store) removeElementLocked(shard *shard, element *list.Element) {
 			s.pendingTotal.Add(^uint64(0)) // Decrement
 		}
 	}
+	if len(node.entry.Response) > 0 {
+		s.responseBytes.Add(-int64(len(node.entry.Response)))
+	}
 	delete(shard.items, node.key)
 	shard.order.Remove(element)
 	s.dirty.Add(1)
@@ -417,10 +454,17 @@ const (
 	binaryVersion uint16 = 2          // v2 adds per-entry ExpiresAt (R-06)
 )
 
+type persistedEntry struct {
+	key   string
+	entry Entry
+}
+
 func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
 	if s == nil || path == "" {
 		return 0, nil
 	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 
 	file, err := os.Open(path)
 	if err != nil {
@@ -429,7 +473,7 @@ func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
 		}
 		return 0, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	var magic uint32
 	if err := binary.Read(file, binary.BigEndian, &magic); err != nil {
@@ -451,69 +495,91 @@ func (s *Store) LoadFromFile(path string, now time.Time) (int, error) {
 	if err := binary.Read(file, binary.BigEndian, &count); err != nil {
 		return 0, err
 	}
-
-	s.pendingTotal.Store(0)
-	for i := 0; i < shardCount; i++ {
-		s.shards[i].mu.Lock()
-		s.shards[i].items = make(map[string]*list.Element, s.maxRecords/shardCount+1)
-		s.shards[i].order.Init()
-		s.shards[i].mu.Unlock()
+	maxLoad := max(s.maxRecords, shardCount)
+	if uint64(count) > uint64(maxLoad) {
+		return 0, fmt.Errorf("persisted cache entry count %d exceeds limit %d", count, maxLoad)
 	}
 
-	loaded := 0
+	entries := make([]persistedEntry, 0, int(count))
+	seen := make(map[string]struct{}, cap(entries))
+	var responseBytes int64
 	br := bufio.NewReader(file)
 	for i := 0; i < int(count); i++ {
 		entry, key, err := readBinaryEntry(br)
 		if err != nil {
-			if err == io.EOF {
-				break
-			}
 			return 0, fmt.Errorf("read cache entry %d failed: %w", i, err)
 		}
 
 		if s.isExpired(&entry, now) {
 			continue
 		}
-
-		shardIdx := getShardIndex(key)
-		shard := &s.shards[shardIdx]
-		shard.mu.Lock()
-		element := shard.order.PushBack(&cacheNode{key: key, entry: entry})
-		shard.items[key] = element
-		shard.mu.Unlock()
-		loaded++
+		if _, duplicate := seen[key]; duplicate {
+			return 0, fmt.Errorf("duplicate cache key in persisted data")
+		}
+		responseBytes += int64(len(entry.Response))
+		if responseBytes > s.maxResponseBytes {
+			return 0, fmt.Errorf("persisted cache response bytes exceed limit %d", s.maxResponseBytes)
+		}
+		seen[key] = struct{}{}
+		entries = append(entries, persistedEntry{key: key, entry: entry})
+	}
+	if _, err := br.ReadByte(); err == nil {
+		return 0, fmt.Errorf("persisted cache contains trailing data")
+	} else if err != io.EOF {
+		return 0, fmt.Errorf("validate cache end failed: %w", err)
 	}
 
+	// Only publish after the entire file validates. A corrupt later entry must
+	// not destroy the currently-live cache or leave a partially loaded state.
 	for i := 0; i < shardCount; i++ {
 		s.shards[i].mu.Lock()
+		defer s.shards[i].mu.Unlock()
+		s.shards[i].items = make(map[string]*list.Element, min(s.maxRecords/shardCount+1, 1024))
+		s.shards[i].order.Init()
+	}
+	s.pendingTotal.Store(0)
+	s.responseBytes.Store(responseBytes)
+	for _, persisted := range entries {
+		shard := &s.shards[getShardIndex(persisted.key)]
+		element := shard.order.PushBack(&cacheNode{key: persisted.key, entry: persisted.entry})
+		shard.items[persisted.key] = element
+	}
+	for i := 0; i < shardCount; i++ {
 		s.evictIfNeededLocked(&s.shards[i])
-		s.shards[i].mu.Unlock()
 	}
 
 	s.dirty.Store(0)
-	return loaded, nil
+	return len(entries), nil
 }
 
 func (s *Store) SaveToFile(path string, now time.Time) (int, error) {
 	if s == nil || path == "" {
 		return 0, nil
 	}
+	s.persistMu.Lock()
+	defer s.persistMu.Unlock()
 
-	if s.dirty.Load() == 0 {
+	startDirty := s.dirty.Load()
+	if startDirty == 0 {
 		return 0, nil
 	}
 
-	tempPath := path + ".tmp"
-	file, err := os.Create(tempPath)
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return 0, err
+	}
+	file, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return 0, err
 	}
+	tempPath := file.Name()
 	defer func() {
 		_ = file.Close()
-		if err != nil {
-			_ = os.Remove(tempPath)
-		}
+		_ = os.Remove(tempPath)
 	}()
+	if err = file.Chmod(0o600); err != nil {
+		return 0, err
+	}
 
 	bw := bufio.NewWriter(file)
 	if err = binary.Write(bw, binary.BigEndian, binaryMagic); err != nil {
@@ -523,41 +589,37 @@ func (s *Store) SaveToFile(path string, now time.Time) (int, error) {
 		return 0, err
 	}
 
-	var total uint32
+	entries := make([]persistedEntry, 0, min(s.maxRecords, 1024))
 	for i := 0; i < shardCount; i++ {
 		shard := &s.shards[i]
 		shard.mu.RLock()
 		for element := shard.order.Front(); element != nil; element = element.Next() {
 			node := element.Value.(*cacheNode)
 			if node.entry.Status == StatusReady && !s.isExpired(&node.entry, now) {
-				total++
+				entry := node.entry
+				entry.Response = append([]byte(nil), entry.Response...)
+				entries = append(entries, persistedEntry{key: node.key, entry: entry})
 			}
 		}
 		shard.mu.RUnlock()
 	}
 
-	if err = binary.Write(bw, binary.BigEndian, total); err != nil {
+	if err = binary.Write(bw, binary.BigEndian, uint32(len(entries))); err != nil {
 		return 0, err
 	}
 
 	saved := 0
-	for i := 0; i < shardCount; i++ {
-		shard := &s.shards[i]
-		shard.mu.RLock()
-		for element := shard.order.Front(); element != nil; element = element.Next() {
-			node := element.Value.(*cacheNode)
-			if node.entry.Status == StatusReady && !s.isExpired(&node.entry, now) {
-				if err = writeBinaryEntry(bw, node.key, &node.entry); err != nil {
-					shard.mu.RUnlock()
-					return saved, err
-				}
-				saved++
-			}
+	for i := range entries {
+		if err = writeBinaryEntry(bw, entries[i].key, &entries[i].entry); err != nil {
+			return saved, err
 		}
-		shard.mu.RUnlock()
+		saved++
 	}
 
 	if err = bw.Flush(); err != nil {
+		return saved, err
+	}
+	if err = file.Sync(); err != nil {
 		return saved, err
 	}
 
@@ -565,15 +627,16 @@ func (s *Store) SaveToFile(path string, now time.Time) (int, error) {
 		return saved, err
 	}
 
-	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return saved, err
-	}
-
 	if err = os.Rename(tempPath, path); err != nil {
 		return saved, err
 	}
+	if d, openErr := os.Open(dir); openErr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 
-	s.dirty.Store(0)
+	// Preserve mutations that happened while the snapshot was being written.
+	s.dirty.Add(^uint64(startDirty - 1))
 	return saved, nil
 }
 
@@ -653,6 +716,10 @@ func readBinaryEntry(r io.Reader) (Entry, string, error) {
 }
 
 func writeBinaryEntry(w io.Writer, key string, entry *Entry) error {
+	maxFieldLen := int(^uint16(0))
+	if len(key) > maxFieldLen || len(entry.Domain) > maxFieldLen || len(entry.Response) > maxFieldLen {
+		return fmt.Errorf("cache entry field exceeds %d-byte persistence limit", maxFieldLen)
+	}
 	if err := binary.Write(w, binary.BigEndian, uint16(len(key))); err != nil {
 		return err
 	}

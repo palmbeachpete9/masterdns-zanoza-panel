@@ -12,10 +12,12 @@ import (
 	"fmt"
 	"time"
 
+	"masterdnsvpn-go/internal/keyring"
+
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	Enums "masterdnsvpn-go/internal/enums"
-	"masterdnsvpn-go/internal/keyring"
+
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -99,7 +101,7 @@ func (s *Server) ReloadKeyring(path string) error {
 	s.ingress.Store(next)
 	// Acknowledge the applied content digest so the panel can confirm the
 	// running server matches the exact desired keyring (R-03).
-	if err := keyring.WriteApplied(path, resolver.Digest()); err != nil {
+	if err := keyring.WriteApplied(path, resolver.Digest(), resolver.Generation()); err != nil {
 		return err
 	}
 	return nil

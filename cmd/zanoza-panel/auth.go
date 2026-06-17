@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -44,15 +45,17 @@ type credentials struct {
 }
 
 const (
-	minPasswordLen = 8
-	maxPasswordLen = 72 // bcrypt input ceiling
-	maxUsernameLen = 64
-	bcryptCost     = 12
+	minPasswordLen         = 8
+	maxPasswordLen         = 72 // bcrypt input ceiling
+	maxUsernameLen         = 64
+	bcryptCost             = 12
+	maxAcceptedBcryptCost  = 16
+	maxCredentialFileBytes = 128 << 10
 )
 
 func loadCredentials(envPath string) *credentials {
 	c := &credentials{envPath: envPath}
-	raw, err := os.ReadFile(envPath)
+	raw, err := readFileLimited(envPath, maxCredentialFileBytes)
 	if err != nil {
 		// A genuinely absent file is first-run. ANY other error (permission
 		// denied, I/O) must fail closed, not be mistaken for first-run (V4-02).
@@ -62,6 +65,7 @@ func loadCredentials(envPath string) *credentials {
 		return c
 	}
 	scanner := bufio.NewScanner(strings.NewReader(string(raw)))
+	seen := make(map[string]struct{}, 4)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -69,26 +73,124 @@ func loadCredentials(envPath string) *credentials {
 		}
 		key, val, ok := strings.Cut(line, "=")
 		if !ok {
-			continue
+			c.loadErr = fmt.Errorf("parse %s: malformed credential line", envPath)
+			return c
 		}
-		val = strings.Trim(strings.TrimSpace(val), "'\"")
-		switch strings.TrimSpace(key) {
+		key = strings.TrimSpace(key)
+		val, err = parseCredentialValue(val)
+		if err != nil {
+			c.loadErr = fmt.Errorf("parse %s: invalid %s value: %w", envPath, key, err)
+			return c
+		}
+		switch key {
 		case "ZANOZA_PANEL_USER":
+			if _, duplicate := seen[key]; duplicate {
+				c.loadErr = fmt.Errorf("parse %s: duplicate %s", envPath, key)
+				return c
+			}
+			seen[key] = struct{}{}
 			c.user = val
 		case "ZANOZA_PANEL_PASS_BCRYPT":
+			if _, duplicate := seen[key]; duplicate {
+				c.loadErr = fmt.Errorf("parse %s: duplicate %s", envPath, key)
+				return c
+			}
+			seen[key] = struct{}{}
 			c.bcryptHash = val
 		case "ZANOZA_PANEL_SALT":
+			if _, duplicate := seen[key]; duplicate {
+				c.loadErr = fmt.Errorf("parse %s: duplicate %s", envPath, key)
+				return c
+			}
+			seen[key] = struct{}{}
 			c.legacySalt = val
 		case "ZANOZA_PANEL_PASS_HASH":
+			if _, duplicate := seen[key]; duplicate {
+				c.loadErr = fmt.Errorf("parse %s: duplicate %s", envPath, key)
+				return c
+			}
+			seen[key] = struct{}{}
 			c.legacyHash = val
 		}
+	}
+	if err := scanner.Err(); err != nil {
+		c.loadErr = fmt.Errorf("parse %s: %w", envPath, err)
+		return c
 	}
 	// A file that exists but does not parse into a usable credential is treated
 	// as malformed and fails closed (e.g. an interrupted write) (V4-02).
 	if c.user == "" || (c.bcryptHash == "" && c.legacyHash == "") {
 		c.loadErr = fmt.Errorf("%s exists but holds no usable credentials", envPath)
+		return c
+	}
+	if err := validateUsername(c.user); err != nil {
+		c.loadErr = fmt.Errorf("parse %s: invalid username: %w", envPath, err)
+		return c
+	}
+	if c.bcryptHash != "" {
+		cost, err := bcrypt.Cost([]byte(c.bcryptHash))
+		if err != nil {
+			c.loadErr = fmt.Errorf("parse %s: invalid bcrypt hash: %w", envPath, err)
+		} else if cost > maxAcceptedBcryptCost {
+			c.loadErr = fmt.Errorf("parse %s: bcrypt cost %d exceeds limit %d", envPath, cost, maxAcceptedBcryptCost)
+		} else if err := tightenCredentialFileMode(envPath); err != nil {
+			c.loadErr = err
+		}
+		return c
+	}
+	decodedHash, err := hex.DecodeString(c.legacyHash)
+	if c.legacySalt == "" || err != nil || len(decodedHash) != sha256.Size {
+		c.loadErr = fmt.Errorf("parse %s: invalid legacy credentials", envPath)
+	} else if err := tightenCredentialFileMode(envPath); err != nil {
+		c.loadErr = err
 	}
 	return c
+}
+
+func tightenCredentialFileMode(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect credential file %s: %w", path, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return fmt.Errorf("credential file %s must be a regular non-symlink file", path)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open credential file %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+		return fmt.Errorf("credential file %s changed while opening", path)
+	}
+	if err := file.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure credential file %s: %w", path, err)
+	}
+	currentInfo, err := os.Lstat(path)
+	if err != nil || currentInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(openedInfo, currentInfo) {
+		return fmt.Errorf("credential file %s changed while securing", path)
+	}
+	return nil
+}
+
+func parseCredentialValue(raw string) (string, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", nil
+	}
+	first := value[0]
+	last := value[len(value)-1]
+	if first == '\'' || first == '"' {
+		if len(value) < 2 || last != first {
+			return "", fmt.Errorf("unmatched quote")
+		}
+		return value[1 : len(value)-1], nil
+	}
+	if last == '\'' || last == '"' {
+		return "", fmt.Errorf("unmatched quote")
+	}
+	return value, nil
 }
 
 // loadError reports a credential read/parse failure, if any.
@@ -141,6 +243,21 @@ func validatePassword(password string) error {
 	return nil
 }
 
+func readCredentialPassword(reader io.Reader) (string, error) {
+	if reader == nil {
+		return "", fmt.Errorf("password input is unavailable")
+	}
+	raw, err := io.ReadAll(io.LimitReader(reader, maxPasswordLen+1))
+	if err != nil {
+		return "", err
+	}
+	password := string(raw)
+	if err := validatePassword(password); err != nil {
+		return "", err
+	}
+	return password, nil
+}
+
 // set replaces the stored credentials. It validates the username/password,
 // hashes with bcrypt, persists atomically, and only then publishes the new
 // values in memory — so a persistence failure never leaves memory and disk
@@ -168,6 +285,47 @@ func (c *credentials) set(user, password string) error {
 	return nil
 }
 
+// changePassword verifies and replaces the current password as one serialized
+// credential transaction. This prevents two concurrent requests that both
+// verified the old password from racing to publish different replacements.
+// The bool reports whether the supplied current password matched.
+func (c *credentials) changePassword(current, password string) (bool, error) {
+	if err := validatePassword(password); err != nil {
+		return false, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	matches := false
+	switch {
+	case c.user == "":
+		return false, nil
+	case c.bcryptHash != "":
+		matches = bcrypt.CompareHashAndPassword([]byte(c.bcryptHash), []byte(current)) == nil
+	case c.legacyHash != "":
+		matches = subtle.ConstantTimeCompare(
+			[]byte(legacyHashPassword(c.legacySalt, current)),
+			[]byte(c.legacyHash),
+		) == 1
+	}
+	if !matches {
+		return false, nil
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	if err != nil {
+		return true, err
+	}
+	if err := c.persistLocked(c.user, string(hash)); err != nil {
+		return true, err
+	}
+	c.bcryptHash = string(hash)
+	c.legacySalt = ""
+	c.legacyHash = ""
+	return true, nil
+}
+
 // createInitial performs the first-run credential bootstrap as a single
 // transactional, locked operation that succeeds exactly once, closing the
 // check-then-set race on the unauthenticated setup endpoint (F03).
@@ -190,6 +348,9 @@ func (c *credentials) createInitial(user, password string) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.loadErr != nil {
+		return c.loadErr
+	}
 	if c.user != "" && (c.bcryptHash != "" || c.legacyHash != "") {
 		return fmt.Errorf("панель уже настроена")
 	}
@@ -249,7 +410,7 @@ func (c *credentials) persistLocked(user, bcryptHash string) error {
 		"ZANOZA_PANEL_USER='%s'\nZANOZA_PANEL_PASS_BCRYPT='%s'\n",
 		user, bcryptHash,
 	)
-	if err := os.MkdirAll(dirOf(c.envPath), 0o755); err != nil {
+	if err := os.MkdirAll(dirOf(c.envPath), 0o700); err != nil {
 		return err
 	}
 	return writeFileAtomic(c.envPath, []byte(body), 0o600)
@@ -260,39 +421,69 @@ func (c *credentials) persistLocked(user, bcryptHash string) error {
 // ---------------------------------------------------------------------------
 
 type loginLimiter struct {
-	mu       sync.Mutex
-	attempts map[string]*attemptRecord
-	max      int           // failures before lockout
-	window   time.Duration // lockout duration
-	cap      int           // max tracked keys (bounded memory)
+	mu          sync.Mutex
+	attempts    map[string]*attemptRecord
+	max         int           // failures before lockout
+	window      time.Duration // lockout duration
+	cap         int           // max tracked keys (bounded memory)
+	inflight    int           // bcrypt checks currently running
+	maxInflight int           // global bcrypt concurrency ceiling
 }
 
 type attemptRecord struct {
 	count     int
 	lockUntil time.Time
 	seen      time.Time
+	inflight  bool
 }
 
 func newLoginLimiter(max int, window time.Duration) *loginLimiter {
 	return &loginLimiter{
-		attempts: make(map[string]*attemptRecord),
-		max:      max,
-		window:   window,
-		cap:      4096,
+		attempts:    make(map[string]*attemptRecord),
+		max:         max,
+		window:      window,
+		cap:         4096,
+		maxInflight: 8,
 	}
 }
 
-// allowed reports whether key may attempt authentication now.
+// allowed reserves one bounded bcrypt verification slot for key. Only one
+// verification per source and maxInflight verifications globally may run at
+// once, so a concurrent login burst cannot bypass failure accounting or exhaust
+// the server with unbounded bcrypt work.
 func (l *loginLimiter) allowed(key string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	rec := l.attempts[key]
 	if rec == nil {
-		return true
+		if l.inflight >= l.maxInflight {
+			return false
+		}
+		if len(l.attempts) >= l.cap {
+			l.evictLocked()
+			// Fail closed when every slot is an active lockout. Evicting a
+			// locked record would let an attacker bypass throttling by spraying
+			// distinct source addresses until the victim record disappears.
+			if len(l.attempts) >= l.cap {
+				return false
+			}
+		}
+		rec = &attemptRecord{}
+		l.attempts[key] = rec
 	}
 	if !rec.lockUntil.IsZero() && time.Now().Before(rec.lockUntil) {
 		return false
 	}
+	if !rec.lockUntil.IsZero() {
+		rec.lockUntil = time.Time{}
+		rec.count = 0
+	}
+	if rec.inflight || l.inflight >= l.maxInflight {
+		return false
+	}
+	rec.inflight = true
+	rec.seen = time.Now()
+	l.inflight++
 	return true
 }
 
@@ -304,8 +495,17 @@ func (l *loginLimiter) fail(key string) {
 	}
 	rec := l.attempts[key]
 	if rec == nil {
+		if len(l.attempts) >= l.cap {
+			return
+		}
 		rec = &attemptRecord{}
 		l.attempts[key] = rec
+	}
+	if rec.inflight {
+		rec.inflight = false
+		if l.inflight > 0 {
+			l.inflight--
+		}
 	}
 	rec.count++
 	rec.seen = time.Now()
@@ -317,24 +517,38 @@ func (l *loginLimiter) fail(key string) {
 
 func (l *loginLimiter) reset(key string) {
 	l.mu.Lock()
+	if rec := l.attempts[key]; rec != nil && rec.inflight && l.inflight > 0 {
+		l.inflight--
+	}
 	delete(l.attempts, key)
 	l.mu.Unlock()
 }
 
-// evictLocked drops the oldest-seen entries when the table is full.
+func (l *loginLimiter) release(key string) {
+	l.mu.Lock()
+	if rec := l.attempts[key]; rec != nil && rec.inflight {
+		rec.inflight = false
+		rec.seen = time.Now()
+		if l.inflight > 0 {
+			l.inflight--
+		}
+	}
+	l.mu.Unlock()
+}
+
+// evictLocked drops expired/stale unlocked entries. Active lockouts are never
+// evicted, because doing so would reopen a currently-throttled credential
+// guessing source.
 func (l *loginLimiter) evictLocked() {
 	now := time.Now()
 	for k, rec := range l.attempts {
-		if rec.lockUntil.IsZero() && now.Sub(rec.seen) > l.window {
+		if rec.inflight {
+			continue
+		}
+		if (!rec.lockUntil.IsZero() && !now.Before(rec.lockUntil)) ||
+			(rec.lockUntil.IsZero() && now.Sub(rec.seen) > l.window) {
 			delete(l.attempts, k)
 		}
-	}
-	// If still full, drop arbitrary entries to stay bounded.
-	for k := range l.attempts {
-		if len(l.attempts) < l.cap {
-			break
-		}
-		delete(l.attempts, k)
 	}
 }
 

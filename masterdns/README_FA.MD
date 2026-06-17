@@ -139,10 +139,10 @@
 
 #### گام ۱.۲.۱: نصب خودکار (اسکریپت)
 
-اگر قصد دارید سرور را روی یک سیستم لینوکسی راه‌اندازی کنید، ساده‌ترین راه استفاده از اسکریپت نصب خودکار است. کافی است دستور زیر را در ترمینال سرور وارد کنید:
+اسکریپت نصب را ابتدا دانلود و بررسی کنید، سپس تگ انتشار ثابت و SHA-256 فایل ZIP را مشخص کنید:
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_linux_install.sh)
+bash server_linux_install.sh --version <RELEASE_TAG> --sha256 <RELEASE_ZIP_SHA256>
 ```
 
 این اسکریپت مراحل نصب و پیکربندی را خودکار انجام می‌دهد. بعد از پایان نصب، سرور اجرا می‌شود و **کلید رمزنگاری** در لاگ ترمینال نمایش داده می‌شود و همچنین در فایل `encrypt_key.txt` کنار فایل اجرایی ذخیره می‌گردد — این کلید را در جای امن نگه دارید.
@@ -279,7 +279,7 @@ docker run -d \
   -v $(pwd)/data:/data \
   -p 53:53/tcp \
   -p 53:53/udp \
-  ghcr.io/masterking32/masterdnsvpn:latest
+  ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST>
 ```
 
 ---
@@ -289,7 +289,7 @@ docker run -d \
 ```yaml
 services:
   masterdnsvpn:
-    image: ghcr.io/masterking32/masterdnsvpn:latest
+    image: ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST>
     restart: unless-stopped
     environment:
       - DOMAIN=v.example.com
@@ -344,7 +344,7 @@ add dst=/data list=MasterDnsVPN src=/containers/mounts/MasterDnsVPN
 /container envs
 add key=DOMAIN list=MasterDnsVPN value=v.example.com
 
-/container add check-certificate=no dns=1.1.1.1 envlists=MasterDnsVPN hostname=MasterDnsVPN interface=MasterDnsVPN layer-dir="" mountlists=MasterDnsVPN name=MasterDnsVPN remote-image=ghcr.io/masterking32/masterdnsvpn:latest root-dir=/containers/data/MasterDnsVPN start-on-boot=yes
+/container add check-certificate=no dns=1.1.1.1 envlists=MasterDnsVPN hostname=MasterDnsVPN interface=MasterDnsVPN layer-dir="" mountlists=MasterDnsVPN name=MasterDnsVPN remote-image=ghcr.io/masterking32/masterdnsvpn@sha256:<IMAGE_DIGEST> root-dir=/containers/data/MasterDnsVPN start-on-boot=yes
 ```
 
 ---

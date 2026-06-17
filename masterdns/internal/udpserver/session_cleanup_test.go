@@ -15,9 +15,11 @@ import (
 
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/config"
+	"masterdnsvpn-go/internal/mlq"
+
 	Enums "masterdnsvpn-go/internal/enums"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
-	"masterdnsvpn-go/internal/mlq"
+
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 

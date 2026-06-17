@@ -10,10 +10,220 @@ package config
 import (
 	"encoding/base64"
 	"flag"
+	"math"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+func TestServerConfigRejectsInvalidUDPHostInsteadOfBindingWildcard(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server_config.toml")
+	if err := os.WriteFile(path, []byte(`
+UDP_HOST = "not-an-ip"
+UDP_PORT = 53
+DOMAIN = ["v.example.com"]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadServerConfig(path); err == nil {
+		t.Fatal("invalid UDP_HOST was accepted; net.ParseIP(nil) would bind wildcard")
+	}
+}
+
+func TestServerConfigAddressFormatsIPv6(t *testing.T) {
+	cfg := ServerConfig{UDPHost: "::1", UDPPort: 53}
+	if got, want := cfg.Address(), net.JoinHostPort("::1", "53"); got != want {
+		t.Fatalf("Address() = %q, want %q", got, want)
+	}
+}
+
+func TestServerConfigRejectsOversizedPacketBuffer(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "server_config.toml")
+	if err := os.WriteFile(path, []byte(`
+UDP_PORT = 53
+MAX_PACKET_SIZE = 1073741824
+DOMAIN = ["v.example.com"]
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadServerConfig(path); err == nil {
+		t.Fatal("oversized packet buffer was accepted")
+	}
+}
+
+func TestServerConfigRejectsInvalidEncryptionMethodInsteadOfDowngrading(t *testing.T) {
+	cfg := defaultServerConfig()
+	cfg.DataEncryptionMethod = 99
+	if _, err := finalizeServerConfig(cfg); err == nil {
+		t.Fatal("invalid encryption method was silently downgraded")
+	}
+}
+
+func TestServerConfigRejectsUnknownKeys(t *testing.T) {
+	t.Run("toml", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "server.toml")
+		if err := os.WriteFile(path, []byte(`
+DOMAIN = ["v.example.com"]
+DATA_ENCRYPTION_METHDO = 5
+`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := LoadServerConfig(path); err == nil {
+			t.Fatal("unknown TOML key was silently ignored")
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		encoded := base64.StdEncoding.EncodeToString([]byte(`{
+			"DOMAIN": ["v.example.com"],
+			"DATA_ENCRYPTION_METHDO": 5
+		}`))
+		if _, err := LoadServerConfigFromJSONBase64(encoded); err == nil {
+			t.Fatal("unknown JSON key was silently ignored")
+		}
+	})
+
+	t.Run("duplicate JSON key", func(t *testing.T) {
+		raw := []byte(`{"UDP_PORT":53,"UDP_PORT":5353}`)
+		encoded := base64.StdEncoding.EncodeToString(raw)
+		if _, err := LoadServerConfigFromJSONBase64(encoded); err == nil {
+			t.Fatal("duplicate JSON config key was accepted")
+		}
+	})
+
+	t.Run("non-object JSON", func(t *testing.T) {
+		encoded := base64.StdEncoding.EncodeToString([]byte(`null`))
+		if _, err := LoadServerConfigFromJSONBase64(encoded); err == nil {
+			t.Fatal("non-object JSON config was accepted")
+		}
+	})
+}
+
+func TestServerConfigRejectsOversizedConfigFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "server_config.toml")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxConfigBytes + 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadServerConfig(path); err == nil {
+		t.Fatal("oversized config file was accepted")
+	}
+}
+
+func TestServerConfigNormalizesNonFiniteAndExtremeDurations(t *testing.T) {
+	cfg := defaultServerConfig()
+	cfg.DropLogIntervalSecs = math.NaN()
+	cfg.SessionTimeoutSecs = math.Inf(1)
+	cfg.DNSUpstreamTimeoutSecs = 1e300
+	cfg.DNSCacheTTLSeconds = 1e300
+
+	final, err := finalizeServerConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]time.Duration{
+		"drop log interval":     final.DropLogInterval(),
+		"session timeout":       final.SessionTimeout(),
+		"dns upstream timeout":  final.DNSUpstreamTimeout(),
+		"dns cache ttl seconds": time.Duration(final.DNSCacheTTLSeconds * float64(time.Second)),
+	} {
+		if value <= 0 {
+			t.Fatalf("%s overflowed to non-positive duration: %s", name, value)
+		}
+	}
+}
+
+func TestServerConfigRejectsExcessiveFanoutLists(t *testing.T) {
+	for name, mutate := range map[string]func(*ServerConfig){
+		"upstreams": func(cfg *ServerConfig) {
+			cfg.DNSUpstreamServers = make([]string, maxConfiguredDNSUpstreams+1)
+		},
+		"domains": func(cfg *ServerConfig) {
+			cfg.Domain = make([]string, maxConfiguredDomains+1)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := defaultServerConfig()
+			mutate(&cfg)
+			if _, err := finalizeServerConfig(cfg); err == nil {
+				t.Fatal("excessive fanout list was accepted")
+			}
+		})
+	}
+}
+
+func TestServerConfigClampsDirectResourceSizingFields(t *testing.T) {
+	cfg := defaultServerConfig()
+	cfg.UDPReaders = int(^uint(0) >> 1)
+	cfg.SocketBufferSize = int(^uint(0) >> 1)
+	cfg.MaxConcurrentRequests = int(^uint(0) >> 1)
+	cfg.DNSRequestWorkers = int(^uint(0) >> 1)
+	cfg.DNSCacheMaxRecords = int(^uint(0) >> 1)
+
+	final, err := finalizeServerConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.UDPReaders > 32 || final.SocketBufferSize > 256*1024*1024 ||
+		final.MaxConcurrentRequests > 131072 || final.DNSRequestWorkers > 256 ||
+		final.DNSCacheMaxRecords > 500000 {
+		t.Fatalf("direct resource fields were not clamped: %+v", final)
+	}
+}
+
+func TestServerConfigRejectsInvalidDomainsBeforeBuildingMatcher(t *testing.T) {
+	for _, domain := range []string{"com", "bad..example.com", "-bad.example.com", "bad_.example.com"} {
+		t.Run(domain, func(t *testing.T) {
+			cfg := defaultServerConfig()
+			cfg.Domain = []string{domain}
+			if _, err := finalizeServerConfig(cfg); err == nil {
+				t.Fatalf("invalid domain %q was accepted", domain)
+			}
+		})
+	}
+
+	cfg := defaultServerConfig()
+	cfg.Domain = []string{" V.Example.COM. ", "v.example.com"}
+	final, err := finalizeServerConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.Domain) != 1 || final.Domain[0] != "v.example.com" {
+		t.Fatalf("domains not canonicalized/deduplicated: %v", final.Domain)
+	}
+}
+
+func TestServerConfigRejectsInvalidDNSUpstreamsAtStartup(t *testing.T) {
+	for _, upstream := range []string{"", ":53", "1.1.1.1:", "1.1.1.1:99999", "[::1]", "not:an:ip", "bad host", "-bad.example:53"} {
+		t.Run(upstream, func(t *testing.T) {
+			cfg := defaultServerConfig()
+			cfg.DNSUpstreamServers = []string{upstream}
+			if _, err := finalizeServerConfig(cfg); err == nil {
+				t.Fatalf("invalid upstream %q was accepted", upstream)
+			}
+		})
+	}
+
+	cfg := defaultServerConfig()
+	cfg.DNSUpstreamServers = []string{"1.1.1.1", "1.1.1.1:53", "::1", "DNS.GOOGLE.", "dns.google:53"}
+	final, err := finalizeServerConfig(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(final.DNSUpstreamServers) != 3 {
+		t.Fatalf("upstreams not normalized/deduplicated: %v", final.DNSUpstreamServers)
+	}
+}
 
 func TestLoadServerConfigWithOverridesAppliesFlagPrecedence(t *testing.T) {
 	dir := t.TempDir()
@@ -141,6 +351,20 @@ func TestServerConfigEffectiveSizingUsesSmartFloorsAndDerivedCapacities(t *testi
 	}
 	if got := cfg.EffectiveSOCKS5FragmentStoreCapacity(); got < 64 {
 		t.Fatalf("expected derived socks5 fragment store cap, got=%d", got)
+	}
+}
+
+func TestServerConfigRequestQueueIsBoundedByPacketMemory(t *testing.T) {
+	cfg := defaultServerConfig()
+	cfg.MaxConcurrentRequests = 131072
+	cfg.MaxPacketSize = 65535
+
+	capacity := cfg.EffectiveRequestQueueCapacity()
+	if capacity >= cfg.EffectiveMaxConcurrentRequests() {
+		t.Fatalf("large-packet queue was not reduced: queue=%d concurrent=%d", capacity, cfg.EffectiveMaxConcurrentRequests())
+	}
+	if got := int64(capacity) * int64(cfg.MaxPacketSize); got > maxQueuedRequestBytes {
+		t.Fatalf("queue retains %d packet bytes, limit=%d", got, maxQueuedRequestBytes)
 	}
 }
 

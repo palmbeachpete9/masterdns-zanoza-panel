@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,7 +33,7 @@ func TestKeyringDigestAck(t *testing.T) {
 	}
 
 	// A STALE marker (different content) must NOT look applied (no replay).
-	if err := os.WriteFile(m.keyringPath+".applied", []byte("deadbeef\n"), 0o600); err != nil {
+	if err := writeTestAppliedMarker(m.keyringPath, "deadbeef", m.desiredGen); err != nil {
 		t.Fatal(err)
 	}
 	if got := readAppliedDigest(m.keyringPath); got == wantHex {
@@ -40,13 +41,21 @@ func TestKeyringDigestAck(t *testing.T) {
 	}
 
 	// Matching marker -> acknowledged.
-	if err := os.WriteFile(m.keyringPath+".applied", []byte(wantHex+"\n"), 0o600); err != nil {
+	if err := writeTestAppliedMarker(m.keyringPath, wantHex, m.desiredGen); err != nil {
 		t.Fatal(err)
 	}
 	st := m.state()
 	if st.DesiredKeyring != wantHex || st.AppliedKeyring != wantHex {
 		t.Fatalf("state digests mismatch: desired=%q applied=%q", st.DesiredKeyring, st.AppliedKeyring)
 	}
+}
+
+func writeTestAppliedMarker(keyringPath, digest string, generation uint64) error {
+	raw, err := json.Marshal(appliedMarker{Digest: digest, Generation: generation})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(keyringPath+".applied", append(raw, '\n'), 0o600)
 }
 
 // F13 — a failed persistence must leave live in-memory state unchanged.

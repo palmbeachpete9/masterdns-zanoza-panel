@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -22,6 +23,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -40,8 +42,10 @@ type server struct {
 	assets         map[string]cachedFile
 	setup          *setupGate
 	externalOrigin *url.URL // configured external origin behind a proxy (V4-03)
+	trustedProxies []*net.IPNet
 	useTLS         bool
 	mu             sync.Mutex
+	authMu         sync.RWMutex // orders password changes against in-flight logins
 }
 
 // cachedFile is an embedded static asset preloaded into shared memory once at
@@ -63,6 +67,11 @@ func buildAssetCache(root fs.FS) (map[string]cachedFile, error) {
 		if d.IsDir() {
 			return nil
 		}
+		if original, ok := conflictCopyOriginal(p); ok {
+			if info, statErr := fs.Stat(root, original); statErr == nil && !info.IsDir() {
+				return fmt.Errorf("embedded asset %q looks like a conflict copy of %q", p, original)
+			}
+		}
 		body, err := fs.ReadFile(root, p)
 		if err != nil {
 			return err
@@ -76,6 +85,29 @@ func buildAssetCache(root fs.FS) (map[string]cachedFile, error) {
 		return nil
 	})
 	return cache, err
+}
+
+func conflictCopyOriginal(name string) (string, bool) {
+	dir := ""
+	base := name
+	if slash := strings.LastIndexByte(name, '/'); slash >= 0 {
+		dir = name[:slash+1]
+		base = name[slash+1:]
+	}
+	ext := ""
+	if dot := strings.LastIndexByte(base, '.'); dot >= 0 {
+		ext = base[dot:]
+		base = base[:dot]
+	}
+	space := strings.LastIndexByte(base, ' ')
+	if space <= 0 || space == len(base)-1 {
+		return "", false
+	}
+	n, err := strconv.Atoi(base[space+1:])
+	if err != nil || n <= 0 {
+		return "", false
+	}
+	return dir + base[:space] + ext, true
 }
 
 func contentTypeFor(name string) string {
@@ -96,19 +128,27 @@ func contentTypeFor(name string) string {
 }
 
 func main() {
-	configPath := flag.String("config", envDefault(EnvConfig, "/etc/zanoza-panel/config.json"), "path to panel config JSON")
-	setCreds := flag.Bool("set-credentials", false, "set admin credentials (bcrypt) from -user/-password and exit")
+	configPath := flag.String("config", envDefault(EnvConfig, "/var/lib/zanoza-panel/config.json"), "path to panel config JSON")
+	setCreds := flag.Bool("set-credentials", false, "set admin credentials (bcrypt) from -user and stdin, then exit")
 	credUser := flag.String("user", "", "username for -set-credentials")
-	credPass := flag.String("password", "", "password for -set-credentials")
+	passwordStdin := flag.Bool("password-stdin", false, "read the -set-credentials password from stdin")
+	legacyCredPass := flag.String("password", "", "unsupported: passwords must be supplied with -password-stdin")
 	flag.Parse()
 
 	// Credential management subcommand: lets the installer and `zanoza
 	// resetcreds` reuse the backend's bcrypt + atomic-persist path instead of
 	// writing legacy SHA-256 in shell (F07/F24).
 	if *setCreds {
+		if *legacyCredPass != "" || !*passwordStdin {
+			log.Fatalf("set credentials: use -password-stdin; command-line passwords are refused because they are visible in process listings")
+		}
+		credPass, err := readCredentialPassword(os.Stdin)
+		if err != nil {
+			log.Fatalf("read credentials password: %v", err)
+		}
 		configDir := filepath.Dir(*configPath)
 		creds := loadCredentials(filepath.Join(configDir, "panel.env"))
-		if err := creds.set(*credUser, *credPass); err != nil {
+		if err := creds.set(*credUser, credPass); err != nil {
 			log.Fatalf("set credentials: %v", err)
 		}
 		fmt.Println("credentials updated")
@@ -119,7 +159,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-	applyEnvOverrides(cfg)
+	if err := applyEnvOverrides(cfg); err != nil {
+		log.Fatalf("invalid environment override: %v", err)
+	}
+	if err := cfg.validateRuntime(); err != nil {
+		log.Fatalf("invalid effective config: %v", err)
+	}
 
 	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
@@ -164,11 +209,15 @@ func main() {
 	// and cookie security derive from it when set (V4-03).
 	var externalOrigin *url.URL
 	if v := os.Getenv(EnvExternalOrigin); v != "" {
-		u, perr := url.Parse(v)
-		if perr != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		u, perr := parseExternalOrigin(v)
+		if perr != nil {
 			log.Fatalf("invalid %s=%q (want scheme://host[:port])", EnvExternalOrigin, v)
 		}
 		externalOrigin = u
+	}
+	trustedProxies, err := parseTrustedProxies(os.Getenv(EnvTrustedProxies))
+	if err != nil {
+		log.Fatalf("invalid %s: %v", EnvTrustedProxies, err)
 	}
 
 	// One-time bootstrap token for first-run setup (DNS-rebinding defence, V4-03).
@@ -189,6 +238,7 @@ func main() {
 		assets:         assets,
 		setup:          setupGate,
 		externalOrigin: externalOrigin,
+		trustedProxies: trustedProxies,
 		useTLS:         useTLS,
 	}
 
@@ -204,22 +254,39 @@ func main() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGHUP)
 		for range ch {
-			if reloaded, err := loadConfig(*configPath); err == nil {
-				applyEnvOverrides(reloaded)
-				// Publish in place under the commit coordinator so reload can't
-				// interleave with an HTTP mutation, and s.cfg identity stays
-				// stable (no stale-pointer handler) (F13).
-				srv.config().publishReload(reloaded)
-				_ = manager.apply(srv.config().snapshot())
-				log.Printf("reloaded config")
+			reloaded, err := loadExistingConfig(*configPath)
+			if err != nil {
+				log.Printf("reload config failed: %v", err)
+				continue
 			}
+			if err := applyEnvOverrides(reloaded); err != nil {
+				log.Printf("reload environment override failed: %v", err)
+				continue
+			}
+			if err := reloaded.validateRuntime(); err != nil {
+				log.Printf("reload effective config failed: %v", err)
+				continue
+			}
+			if err := validateHotReload(srv.config(), reloaded); err != nil {
+				log.Printf("reload config failed: %v", err)
+				continue
+			}
+			// Publish in place under the commit coordinator so reload can't
+			// interleave with an HTTP mutation, and s.cfg identity stays
+			// stable (no stale-pointer handler) (F13).
+			srv.config().publishReload(reloaded)
+			if err := manager.apply(srv.config().snapshot()); err != nil {
+				log.Printf("reload apply failed: %v", err)
+				continue
+			}
+			log.Printf("reloaded config")
 		}
 	}()
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", srv.route)
 
-	addr := fmt.Sprintf("%s:%d", cfg.PanelAddr, cfg.PanelPort)
+	addr := net.JoinHostPort(cfg.PanelAddr, strconv.Itoa(cfg.PanelPort))
 	httpServer := &http.Server{
 		Addr:              addr,
 		Handler:           mux,
@@ -246,15 +313,33 @@ func main() {
 	}
 }
 
-func isLoopbackAddr(addr string) bool {
-	switch addr {
-	case "", "127.0.0.1", "::1", "localhost":
-		return true
+func validateHotReload(current, reloaded *Config) error {
+	before := current.Meta()
+	after := reloaded.Meta()
+	if before.PanelAddr != after.PanelAddr || before.PanelPort != after.PanelPort ||
+		before.TLSCert != after.TLSCert || before.TLSKey != after.TLSKey {
+		return fmt.Errorf("panel listener or TLS settings changed; restart is required")
 	}
+	return nil
+}
+
+func isLoopbackAddr(addr string) bool {
 	if ip := net.ParseIP(addr); ip != nil {
 		return ip.IsLoopback()
 	}
+	// Hostnames, including "localhost", are not trusted here: a poisoned hosts
+	// file or resolver result could make a hostname bind a non-loopback address
+	// while bypassing the plaintext-public-listener guard.
 	return false
+}
+
+func parseExternalOrigin(value string) (*url.URL, error) {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("invalid external origin")
+	}
+	return u, nil
 }
 
 // route dispatches by the configured panel path; everything outside it is a
@@ -394,18 +479,15 @@ type errBodyTooLarge struct{ error }
 // the ResponseWriter so http.MaxBytesReader can abort an oversized stream.
 func readJSON(w http.ResponseWriter, r *http.Request, v any) error {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBody)
-	dec := json.NewDecoder(r.Body)
-	if err := dec.Decode(v); err != nil {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
 			return errBodyTooLarge{err}
 		}
 		return err
 	}
-	if dec.More() {
-		return fmt.Errorf("unexpected trailing JSON")
-	}
-	return nil
+	return decodeStrictJSONObject(raw, v)
 }
 
 // writeBadBody turns a readJSON error into the right status code.
@@ -434,11 +516,76 @@ func (s *server) authenticated(r *http.Request) bool {
 }
 
 // clientIP extracts the remote host for rate-limit keying.
-func clientIP(r *http.Request) string {
+func remoteIP(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+func parseTrustedProxies(value string) ([]*net.IPNet, error) {
+	var out []*net.IPNet
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if ip := net.ParseIP(item); ip != nil {
+			bits := 128
+			if ip.To4() != nil {
+				bits = 32
+			}
+			out = append(out, &net.IPNet{IP: ip, Mask: net.CIDRMask(bits, bits)})
+			continue
+		}
+		_, network, err := net.ParseCIDR(item)
+		if err != nil {
+			return nil, fmt.Errorf("%q is not an IP address or CIDR", item)
+		}
+		out = append(out, network)
+	}
+	return out, nil
+}
+
+func (s *server) isTrustedProxy(ip net.IP) bool {
+	for _, network := range s.trustedProxies {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP uses forwarding headers only when the direct peer is explicitly
+// trusted. Walking right-to-left prevents an external client from prepending a
+// spoofed address to a proxy-maintained chain.
+func (s *server) clientIP(r *http.Request) string {
+	direct := remoteIP(r)
+	if !s.isTrustedProxy(net.ParseIP(direct)) {
+		return direct
+	}
+	chain := r.Header.Values("X-Forwarded-For")
+	if len(chain) == 0 {
+		return direct
+	}
+	var hops []string
+	for _, value := range chain {
+		for _, hop := range strings.Split(value, ",") {
+			if hop = strings.TrimSpace(hop); hop != "" {
+				hops = append(hops, hop)
+			}
+		}
+	}
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(hops[i])
+		if ip == nil {
+			return direct
+		}
+		if !s.isTrustedProxy(ip) {
+			return ip.String()
+		}
+	}
+	return direct
 }
 
 func (s *server) requireAuth(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
@@ -504,7 +651,8 @@ func hasJSONContentType(r *http.Request) bool {
 
 func (s *server) originMatches(origin, host string) bool {
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") ||
+		u.RawQuery != "" || u.Fragment != "" {
 		return false
 	}
 	// When an external origin is configured (reverse proxy), validate against it
@@ -563,7 +711,7 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 	// here directly (it does not pass through requireAuth): require an exact
 	// same-origin browser request, and a JSON content type to force a CORS
 	// preflight for cross-origin attempts (R-02).
-	if !s.strictSameOrigin(r) || !hasJSONContentType(r) {
+	if s.setup == nil || !s.setup.required() || !s.strictSameOrigin(r) || !hasJSONContentType(r) {
 		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
@@ -610,16 +758,23 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "cross-origin request rejected")
 		return
 	}
-	limitKey := clientIP(r)
-	if !s.limiter.allowed(limitKey) {
-		writeErr(w, http.StatusTooManyRequests, "слишком много попыток, попробуйте позже")
-		return
-	}
 	var body struct{ User, Password string }
 	if err := readJSON(w, r, &body); err != nil {
 		writeBadBody(w, err)
 		return
 	}
+	limitKey := s.clientIP(r)
+	if !s.limiter.allowed(limitKey) {
+		writeErr(w, http.StatusTooManyRequests, "слишком много попыток, попробуйте позже")
+		return
+	}
+	defer s.limiter.release(limitKey)
+	// A password change takes the write side of authMu through credential
+	// replacement and session revocation. Holding the read side through session
+	// creation prevents an old-password login from minting a session just after
+	// the password-change handler revoked existing sessions.
+	s.authMu.RLock()
+	defer s.authMu.RUnlock()
 	if !s.creds.verify(strings.TrimSpace(body.User), body.Password) {
 		s.limiter.fail(limitKey)
 		writeErr(w, http.StatusUnauthorized, "неверный логин или пароль")
@@ -659,14 +814,26 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 		writeBadBody(w, err)
 		return
 	}
-	if !s.creds.verify(s.creds.username(), body.Current) {
-		writeErr(w, http.StatusForbidden, "текущий пароль неверен")
+	limitKey := "password:" + s.clientIP(r)
+	if !s.limiter.allowed(limitKey) {
+		writeErr(w, http.StatusTooManyRequests, "слишком много попыток, попробуйте позже")
 		return
 	}
-	if err := s.creds.set(s.creds.username(), body.Password); err != nil {
+	defer s.limiter.release(limitKey)
+
+	s.authMu.Lock()
+	defer s.authMu.Unlock()
+	matched, err := s.creds.changePassword(body.Current, body.Password)
+	if err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if !matched {
+		s.limiter.fail(limitKey)
+		writeErr(w, http.StatusForbidden, "текущий пароль неверен")
+		return
+	}
+	s.limiter.reset(limitKey)
 	// A password change invalidates every existing session (F07).
 	s.sessions.revokeAll()
 	s.setSessionCookie(w, "")
@@ -774,6 +941,7 @@ func (s *server) handleInstancesCollection(w http.ResponseWriter, r *http.Reques
 	}
 	in.ID = newInstanceID()
 	in.CreatedAt = time.Now().UTC().Format(time.RFC3339)
+	in.Key = strings.TrimSpace(in.Key)
 	if d, err := canonicalDomain(in.Domain); err == nil {
 		in.Domain = d // store canonical form (F06)
 	}
@@ -805,7 +973,7 @@ func (s *server) handleInstanceItem(w http.ResponseWriter, r *http.Request, id s
 			updated := list[idx]
 			updated.Label = in.Label
 			updated.Domain = in.Domain
-			updated.Key = in.Key
+			updated.Key = strings.TrimSpace(in.Key)
 			updated.Method = in.Method
 			if d, err := canonicalDomain(updated.Domain); err == nil {
 				updated.Domain = d // store canonical form (F06)
@@ -904,7 +1072,8 @@ func validateInstance(list []Instance, in Instance, selfID string) error {
 	if err != nil {
 		return err
 	}
-	if strings.TrimSpace(in.Key) == "" {
+	key := strings.TrimSpace(in.Key)
+	if key == "" {
 		return fmt.Errorf("ключ обязателен")
 	}
 	if in.Method < 0 || in.Method > 5 {
@@ -921,7 +1090,7 @@ func validateInstance(list []Instance, in Instance, selfID string) error {
 		}
 	}
 	for _, s := range siblings {
-		if s.Key == in.Key {
+		if strings.TrimSpace(s.Key) == key {
 			return fmt.Errorf("такой ключ уже используется на этом домене")
 		}
 	}

@@ -82,8 +82,10 @@ func NewWithFile(name, rawLevel, filePath string) *Logger {
 	if filePath != "" {
 		// Logs may contain operational detail; never group/world-readable (V4-04).
 		f, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-		if err == nil {
+		if err == nil && f.Chmod(0o600) == nil {
 			fileWriter = f
+		} else if f != nil {
+			_ = f.Close()
 		}
 	}
 

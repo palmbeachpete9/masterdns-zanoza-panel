@@ -44,6 +44,28 @@ func TestParsePacketLiteParsesAllQuestions(t *testing.T) {
 	}
 }
 
+func TestParsersRejectImpossibleCountsBeforeAllocation(t *testing.T) {
+	packet := make([]byte, dnsHeaderSize)
+	packet[4], packet[5] = 0xff, 0xff
+	if _, err := ParsePacketLite(packet); err == nil {
+		t.Fatal("lite parser accepted impossible question count")
+	}
+
+	packet[4], packet[5] = 0, 0
+	packet[6], packet[7] = 0xff, 0xff
+	if _, err := ParsePacket(packet); err == nil {
+		t.Fatal("full parser accepted impossible answer count")
+	}
+}
+
+func TestParsePacketRejectsTrailingGarbage(t *testing.T) {
+	packet := make([]byte, dnsHeaderSize+1)
+	packet[dnsHeaderSize] = 0xFF
+	if _, err := ParsePacket(packet); err == nil {
+		t.Fatal("full parser accepted trailing garbage")
+	}
+}
+
 type liteQuestionSpec struct {
 	Name  string
 	Type  uint16

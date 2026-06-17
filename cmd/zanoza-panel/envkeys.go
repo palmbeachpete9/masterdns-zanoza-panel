@@ -25,4 +25,7 @@ const (
 	// CSRF/origin checks validate against it and cookie Secure is derived from
 	// it instead of the internal listener scheme (V4-03).
 	EnvExternalOrigin = "ZANOZA_EXTERNAL_ORIGIN"
+	// EnvTrustedProxies is a comma-separated list of IP addresses or CIDRs whose
+	// Forwarded/X-Forwarded-For headers may be used for per-client rate limits.
+	EnvTrustedProxies = "ZANOZA_TRUSTED_PROXIES"
 )

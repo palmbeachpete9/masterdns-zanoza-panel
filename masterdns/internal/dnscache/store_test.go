@@ -1,15 +1,23 @@
 package dnscache
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
+func TestNewClampsExcessiveRecordLimit(t *testing.T) {
+	store := New(int(^uint(0)>>1), time.Hour, time.Second)
+	if store.maxRecords != maxCacheRecords {
+		t.Fatalf("maxRecords = %d, want %d", store.maxRecords, maxCacheRecords)
+	}
+}
+
 func TestStore_BinaryPersistence(t *testing.T) {
 	tempFile := "test_cache.bin"
-	defer os.Remove(tempFile)
+	defer func() { _ = os.Remove(tempFile) }()
 
 	s := New(100, time.Hour, time.Minute)
 	now := time.Now()
@@ -64,7 +72,6 @@ func TestStore_BinaryPersistence(t *testing.T) {
 }
 
 func TestStore_Sharding(t *testing.T) {
-	s := New(10, time.Hour, time.Minute)
 	now := time.Now()
 
 	// Fill shard-limited capacity
@@ -73,7 +80,7 @@ func TestStore_Sharding(t *testing.T) {
 	// If maxRecords is 10, limit is 0 (set to 1).
 
 	// Let's use more records
-	s = New(100, time.Hour, time.Minute) // 100/32 = 3 per shard
+	s := New(100, time.Hour, time.Minute) // 100/32 = 3 per shard
 
 	for i := 0; i < 200; i++ {
 		domain := "domain" + string(rune(i))
@@ -130,5 +137,141 @@ func TestStoreLoadFromFileFailsOnCorruptEntry(t *testing.T) {
 	}
 	if _, ok := s2.GetReady(key, []byte("\x12\x34"), now); ok {
 		t.Fatal("expected corrupt load not to retain partially loaded cache entries")
+	}
+}
+
+func TestStoreSaveCreatesPrivateParentAndFile(t *testing.T) {
+	root := t.TempDir()
+	cachePath := filepath.Join(root, "nested", "cache.bin")
+	s := New(100, time.Hour, time.Minute)
+	now := time.Now()
+	s.SetReady(BuildKey("example.com", 1, 1), "example.com", 1, 1, []byte("\x00\x00answer"), time.Hour, now)
+
+	if _, err := s.SaveToFile(cachePath, now); err != nil {
+		t.Fatalf("SaveToFile failed: %v", err)
+	}
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("cache mode = %o, want 600", info.Mode().Perm())
+	}
+}
+
+func TestStoreCorruptLoadPreservesLiveCache(t *testing.T) {
+	now := time.Now()
+	s := New(100, time.Hour, time.Minute)
+	liveKey := BuildKey("live.example", 1, 1)
+	s.SetReady(liveKey, "live.example", 1, 1, []byte("\x00\x00live"), time.Hour, now)
+
+	path := filepath.Join(t.TempDir(), "corrupt-later.bin")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(file, binary.BigEndian, binaryMagic); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(file, binary.BigEndian, binaryVersion); err != nil {
+		t.Fatal(err)
+	}
+	if err := binary.Write(file, binary.BigEndian, uint32(2)); err != nil {
+		t.Fatal(err)
+	}
+	entry := Entry{
+		Domain:        "first.example",
+		QuestionType:  1,
+		QuestionClass: 1,
+		Status:        StatusReady,
+		CreatedAt:     now,
+		LastUsedAt:    now,
+		ExpiresAt:     now.Add(time.Hour),
+		Response:      []byte("\x00\x00first"),
+	}
+	if err := writeBinaryEntry(file, BuildKey(entry.Domain, 1, 1), &entry); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{0xff}); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := s.LoadFromFile(path, now); err == nil {
+		t.Fatal("expected corrupt load to fail")
+	}
+	if _, ok := s.GetReady(liveKey, []byte("\x12\x34"), now); !ok {
+		t.Fatal("corrupt load destroyed the live cache")
+	}
+}
+
+func TestStoreLoadRejectsDeclaredCountMismatchAndTrailingData(t *testing.T) {
+	now := time.Now()
+	entry := Entry{
+		Domain:        "one.example",
+		QuestionType:  1,
+		QuestionClass: 1,
+		Status:        StatusReady,
+		CreatedAt:     now,
+		LastUsedAt:    now,
+		ExpiresAt:     now.Add(time.Hour),
+		Response:      []byte("\x00\x00one"),
+	}
+	for name, tc := range map[string]struct {
+		count    uint32
+		trailing []byte
+	}{
+		"missing declared entry": {count: 2},
+		"trailing entry bytes":   {count: 1, trailing: []byte{0xaa}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cache.bin")
+			file, err := os.Create(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, value := range []any{binaryMagic, binaryVersion, tc.count} {
+				if err := binary.Write(file, binary.BigEndian, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := writeBinaryEntry(file, BuildKey(entry.Domain, 1, 1), &entry); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.Write(tc.trailing); err != nil {
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := New(100, time.Hour, time.Minute).LoadFromFile(path, now); err == nil {
+				t.Fatal("malformed persisted cache was accepted")
+			}
+		})
+	}
+}
+
+func TestStoreSaveRejectsEntryFieldsThatCannotBeEncoded(t *testing.T) {
+	now := time.Now()
+	store := New(10, time.Hour, time.Minute)
+	store.SetReady("key", "oversized.example", 1, 1, make([]byte, int(^uint16(0))+1), time.Hour, now)
+	if _, err := store.SaveToFile(filepath.Join(t.TempDir(), "cache.bin"), now); err == nil {
+		t.Fatal("oversized response was silently length-truncated")
+	}
+}
+
+func TestStoreRefusesResponsesBeyondGlobalByteBudget(t *testing.T) {
+	now := time.Now()
+	store := New(100, time.Hour, time.Minute)
+	store.maxResponseBytes = 8
+	key := BuildKey("large.example", 1, 1)
+	store.SetReady(key, "large.example", 1, 1, []byte("\x00\x00oversized"), time.Hour, now)
+	if _, ok := store.GetReady(key, []byte("\x12\x34"), now); ok {
+		t.Fatal("response beyond the global cache byte budget was stored")
+	}
+	if got := store.responseBytes.Load(); got != 0 {
+		t.Fatalf("response byte accounting leaked %d bytes", got)
 	}
 }

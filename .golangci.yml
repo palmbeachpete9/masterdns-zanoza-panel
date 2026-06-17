@@ -6,18 +6,5 @@ linters:
     - misspell      # typos in comments/strings
     - testifylint   # checks testify assertions
 
-formatters:
-  enable:
-    - gofumpt       # stricter go formatting
-    - goimports     # import ordering + auto-import
-
 run:
   tests: true
-
-issues:
-  max-issues-per-linter: 50
-  max-same-issues: 5
-  exclude-files:
-    # Exclude vendored/generated files when they appear
-    - ".*\\.pb\\.go$"
-    - ".*\\.gen\\.go$"

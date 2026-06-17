@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/logger"
+
+	Enums "masterdnsvpn-go/internal/enums"
+
 	SocksProto "masterdnsvpn-go/internal/socksproto"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -284,11 +286,7 @@ func (s *Server) preprocessInboundPacket(vpnPacket VpnProto.Packet) bool {
 		_ = s.queueImmediateControlAck(record, vpnPacket)
 	}
 
-	if s.consumeInboundStreamAck(vpnPacket, existingStream) {
-		return true
-	}
-
-	return false
+	return s.consumeInboundStreamAck(vpnPacket, existingStream)
 }
 
 func (s *Server) handlePackedControlBlocksRequest(vpnPacket VpnProto.Packet, sessionRecord *sessionRuntimeView) bool {
@@ -332,11 +330,6 @@ func (s *Server) handlePackedControlBlocksRequest(vpnPacket VpnProto.Packet, ses
 		return true
 	})
 	return handled || sawBlock
-}
-
-func (s *Server) dispatchDeferredSessionPacketOrDrop(vpnPacket VpnProto.Packet, reason string, run func(context.Context)) bool {
-	result := s.dispatchDeferredSessionPacketTracked(vpnPacket, reason, run)
-	return result != deferredDispatchDropped
 }
 
 func deferredTrackedPacketKey(packet VpnProto.Packet) uint64 {

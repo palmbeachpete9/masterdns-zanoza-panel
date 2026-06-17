@@ -17,11 +17,13 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/config"
+	"masterdnsvpn-go/internal/logger"
+	"masterdnsvpn-go/internal/security"
+
 	dnsCache "masterdnsvpn-go/internal/dnscache"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
-	"masterdnsvpn-go/internal/logger"
-	"masterdnsvpn-go/internal/security"
+
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -76,14 +78,11 @@ type Server struct {
 	externalSOCKS5Auth       bool
 	externalSOCKS5User       []byte
 	externalSOCKS5Pass       []byte
-	streamOutboundTTL        time.Duration
-	streamOutboundMaxRetry   int
 	mtuProbePayloadPool      sync.Pool
 	packetPool               sync.Pool
 	deferredInflightMu       sync.Mutex
 	deferredInflight         map[uint64]struct{}
 	deferredInflightIndex    map[uint8]map[uint16]map[uint64]struct{}
-	immediateConnectedLog    throttledLogState
 	invalidSessionDropLog    throttledLogState
 	droppedPackets           atomic.Uint64
 	lastDropLogUnix          atomic.Int64
@@ -94,10 +93,11 @@ type Server struct {
 }
 
 type request struct {
-	buf  []byte
-	size int
-	addr *net.UDPAddr
-	conn *net.UDPConn
+	buf        []byte
+	size       int
+	addr       *net.UDPAddr
+	conn       *net.UDPConn
+	poolBuffer *[]byte
 }
 
 type postSessionValidation struct {
@@ -107,6 +107,11 @@ type postSessionValidation struct {
 }
 
 func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Server {
+	if log == nil {
+		// New is also used as a library constructor. Supplying nil must not
+		// leave dozens of runtime logging paths able to panic.
+		log = logger.New("MasterDnsVPN Server", cfg.LogLevel)
+	}
 	invalidCookieWindow := cfg.InvalidCookieWindow()
 	if invalidCookieWindow <= 0 {
 		invalidCookieWindow = 2 * time.Second
@@ -147,7 +152,8 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		dnsFragmentTimeout: dnsFragmentTimeout,
 		dnsUpstreamBufferPool: sync.Pool{
 			New: func() any {
-				return make([]byte, 65535)
+				buffer := make([]byte, 65535)
+				return &buffer
 			},
 		},
 		dialStreamUpstreamFn: func(network, address string, timeout time.Duration) (net.Conn, error) {
@@ -167,14 +173,16 @@ func New(cfg config.ServerConfig, log *logger.Logger, codec *security.Codec) *Se
 		externalSOCKS5Pass:       []byte(cfg.SOCKS5Pass),
 		mtuProbePayloadPool: sync.Pool{
 			New: func() any {
-				return make([]byte, mtuProbeMaxDownSize)
+				buffer := make([]byte, mtuProbeMaxDownSize)
+				return &buffer
 			},
 		},
 		deferredInflight:      make(map[uint64]struct{}, 128),
 		deferredInflightIndex: make(map[uint8]map[uint16]map[uint64]struct{}, 64),
 		packetPool: sync.Pool{
 			New: func() any {
-				return make([]byte, cfg.MaxPacketSize)
+				buffer := make([]byte, cfg.MaxPacketSize)
+				return &buffer
 			},
 		},
 	}
@@ -305,6 +313,9 @@ func splitDeferredSessionPools(totalWorkers, totalQueue int) (dnsWorkers, connec
 }
 
 func (s *Server) Run(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -323,11 +334,11 @@ func (s *Server) Run(ctx context.Context) error {
 		s.cfg.Address(),
 		s.cfg.EffectiveUDPReaders(),
 		s.cfg.EffectiveDNSRequestWorkers(),
-		s.cfg.EffectiveMaxConcurrentRequests(),
+		s.cfg.EffectiveRequestQueueCapacity(),
 		len(conns),
 	)
 
-	reqCh := make(chan request, s.cfg.EffectiveMaxConcurrentRequests())
+	reqCh := make(chan request, s.cfg.EffectiveRequestQueueCapacity())
 	var workerWG sync.WaitGroup
 	cleanupDone := make(chan struct{})
 
@@ -351,6 +362,16 @@ func (s *Server) Run(ctx context.Context) error {
 	var readerWG sync.WaitGroup
 	s.startReaders(runCtx, conns, reqCh, readErrCh, &readerWG)
 
+	var readErr error
+	select {
+	case <-runCtx.Done():
+	case readErr = <-readErrCh:
+		// One unexpected socket read failure is fatal for this Run generation.
+		// Cancel immediately so the close watcher releases every other reader;
+		// waiting for all readers before observing readErr would otherwise hang
+		// forever on the still-healthy sockets.
+		cancel()
+	}
 	readerWG.Wait()
 	close(reqCh)
 	workerWG.Wait()
@@ -360,11 +381,5 @@ func (s *Server) Run(ctx context.Context) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-
-	select {
-	case err := <-readErrCh:
-		return err
-	default:
-		return nil
-	}
+	return readErr
 }

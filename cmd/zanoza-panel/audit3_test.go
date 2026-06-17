@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -144,7 +145,9 @@ func TestApplyStateTruthful(t *testing.T) {
 		t.Fatal(err)
 	}
 	m.lastApplyErr = "stale transient error"
-	if err := os.WriteFile(m.keyringPath+".applied", []byte(m.desiredDigest+"\n"), 0o600); err != nil {
+	m.cmd = &exec.Cmd{}
+	m.pid = 1
+	if err := writeTestAppliedMarker(m.keyringPath, m.desiredDigest, m.desiredGen); err != nil {
 		t.Fatal(err)
 	}
 	if st := m.state(); st.ApplyError != "" {

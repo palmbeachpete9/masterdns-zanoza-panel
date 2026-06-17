@@ -25,8 +25,9 @@ import (
 	"masterdnsvpn-go/internal/logger"
 	"masterdnsvpn-go/internal/runtimepath"
 	"masterdnsvpn-go/internal/security"
-	UDPServer "masterdnsvpn-go/internal/udpserver"
 	"masterdnsvpn-go/internal/version"
+
+	UDPServer "masterdnsvpn-go/internal/udpserver"
 )
 
 // keyFingerprint returns a short non-secret identifier for an encryption key so
@@ -90,7 +91,6 @@ func main() {
 	switch {
 	case effectiveJSONBase64 != "":
 		cfg, err = config.LoadServerConfigFromJSONBase64WithOverrides(effectiveJSONBase64, overrides)
-		resolvedConfigPath = cfg.ConfigPath
 	case effectiveJSONPath != "":
 		resolvedConfigPath = runtimepath.Resolve(effectiveJSONPath)
 		cfg, err = config.LoadServerConfigWithOverrides(resolvedConfigPath, overrides)
@@ -182,7 +182,7 @@ func main() {
 		srv.SetKeyResolver(keyResolver)
 		// Acknowledge the initially-loaded content digest (R-03).
 		if keyringPath != "" {
-			if err := keyring.WriteApplied(keyringPath, keyResolver.Digest()); err != nil {
+			if err := keyring.WriteApplied(keyringPath, keyResolver.Digest(), keyResolver.Generation()); err != nil {
 				log.Errorf("❌ <red>Keyring Applied-Marker Write Failed</red> <magenta>|</magenta> <cyan>%v</cyan>", err)
 			}
 		}

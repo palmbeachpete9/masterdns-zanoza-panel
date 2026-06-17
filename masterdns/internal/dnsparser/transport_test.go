@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"masterdnsvpn-go/internal/compression"
+
 	Enums "masterdnsvpn-go/internal/enums"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
@@ -53,6 +54,103 @@ func TestBuildAndExtractVPNResponsePacketSingleAnswer(t *testing.T) {
 	}
 	if !bytes.Equal(packet.Payload, []byte("challenge")) {
 		t.Fatalf("unexpected payload: got=%q", packet.Payload)
+	}
+}
+
+func TestExtractVPNResponseRejectsTruncatedTXTCharacterString(t *testing.T) {
+	query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatalf("BuildTXTQuestionPacket returned error: %v", err)
+	}
+	rawFrame, err := VpnProto.BuildRaw(VpnProto.BuildOptions{
+		SessionID:  7,
+		PacketType: Enums.PACKET_MTU_DOWN_RES,
+		StreamID:   1,
+		Payload:    []byte("payload"),
+	})
+	if err != nil {
+		t.Fatalf("BuildRaw returned error: %v", err)
+	}
+	response, err := BuildTXTResponsePacket(
+		query,
+		"x.v.example.com",
+		[][]byte{appendLengthPrefixedTXT(rawFrame)},
+	)
+	if err != nil {
+		t.Fatalf("BuildTXTResponsePacket returned error: %v", err)
+	}
+	frameOffset := bytes.Index(response, rawFrame)
+	if frameOffset <= 0 {
+		t.Fatal("raw frame not found in response")
+	}
+	response[frameOffset-1]++
+
+	if _, err := ExtractVPNResponse(response, false); !errors.Is(err, ErrTXTAnswerMalformed) {
+		t.Fatalf("expected ErrTXTAnswerMalformed, got %v", err)
+	}
+}
+
+func TestBuildTXTResponsePacketRejectsUnencodableAnswerCountsAndLengths(t *testing.T) {
+	query, err := BuildTXTQuestionPacket("x.v.example.com", Enums.DNS_RECORD_TYPE_TXT, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := BuildTXTResponsePacket(query, "x.v.example.com", nil); err == nil {
+		t.Fatal("zero-answer TXT response was accepted")
+	}
+	if _, err := BuildTXTResponsePacket(query, "x.v.example.com", [][]byte{make([]byte, int(^uint16(0))+1)}); err == nil {
+		t.Fatal("oversized TXT answer payload was accepted")
+	}
+	if _, err := BuildTXTResponsePacket(query, "x.v.example.com", make([][]byte, int(^uint16(0))+1)); err == nil {
+		t.Fatal("unencodable TXT answer count was accepted")
+	}
+	if _, err := BuildTXTResponsePacket(make([]byte, maxDNSPacketSize+1), "x.v.example.com", [][]byte{{0}}); err == nil {
+		t.Fatal("oversized DNS question packet was accepted")
+	}
+	many := make([][]byte, 300)
+	for i := range many {
+		many[i] = bytes.Repeat([]byte("x"), maxTXTAnswerPayload)
+	}
+	if _, err := BuildTXTResponsePacket(query, "x.v.example.com", many); err == nil {
+		t.Fatal("oversized DNS TXT response packet was accepted")
+	}
+}
+
+func TestBuildTXTResponsePacketHandlesUncompressibleRepeatedAnswerNames(t *testing.T) {
+	longName := strings.Join([]string{
+		strings.Repeat("a", 63),
+		strings.Repeat("b", 63),
+		strings.Repeat("c", 63),
+		strings.Repeat("d", 55),
+		"eabcd",
+	}, ".")
+	questions := make([]liteQuestionSpec, maxLikelyQuestions)
+	for i := range questions {
+		questions[i] = liteQuestionSpec{
+			Name:  longName,
+			Type:  Enums.DNS_RECORD_TYPE_TXT,
+			Class: Enums.DNSQ_CLASS_IN,
+		}
+	}
+	query := buildMultiQuestionDNSQuery(0x4242, questions, false)
+	questionEndOffset, err := skipQuestions(query, dnsHeaderSize, len(questions))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if questionEndOffset <= 0x3FFF {
+		t.Fatalf("test query did not push first answer beyond compression range: offset=%d", questionEndOffset)
+	}
+
+	response, err := BuildTXTResponsePacket(query, "answer.example.com", [][]byte{{1}, {2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParsePacket(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parsed.Answers) != 2 {
+		t.Fatalf("answer count = %d, want 2", len(parsed.Answers))
 	}
 }
 

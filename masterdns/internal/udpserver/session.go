@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/mlq"
+
+	Enums "masterdnsvpn-go/internal/enums"
+
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
 )
 
@@ -744,13 +746,6 @@ func (r *sessionRecord) markClosed() {
 		return
 	}
 	atomic.StoreUint32(&r.closedFlag, 1)
-}
-
-func (r *sessionRecord) reopen() {
-	if r == nil {
-		return
-	}
-	atomic.StoreUint32(&r.closedFlag, 0)
 }
 
 func (r *sessionRecord) isClosed() bool {

@@ -4,10 +4,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
+
+	"github.com/BurntSushi/toml"
 )
 
 type configSourceFormat uint8
@@ -17,18 +20,40 @@ const (
 	configSourceJSON
 )
 
+const maxConfigBytes = 8 << 20
+
+var ignoredConfigKeys = map[string]struct{}{
+	"CONFIG_VERSION": {},
+}
+
+func readConfigFileLimited(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(file, maxConfigBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > maxConfigBytes {
+		return nil, fmt.Errorf("config %s exceeds the %d-byte size limit", path, maxConfigBytes)
+	}
+	return raw, nil
+}
+
 func decodeConfigJSONInto(dst any, raw []byte) (map[string]bool, error) {
 	if dst == nil {
 		return nil, fmt.Errorf("config target is nil")
 	}
 
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	doc, err := decodeUniqueJSONObject(raw)
+	if err != nil {
 		return nil, err
 	}
 
 	value := reflect.ValueOf(dst)
-	if value.Kind() != reflect.Ptr || value.IsNil() {
+	if value.Kind() != reflect.Pointer || value.IsNil() {
 		return nil, fmt.Errorf("config target must be a non-nil pointer")
 	}
 	value = value.Elem()
@@ -38,6 +63,10 @@ func decodeConfigJSONInto(dst any, raw []byte) (map[string]bool, error) {
 
 	valueType := value.Type()
 	defined := make(map[string]bool, len(doc))
+	known := make(map[string]struct{}, valueType.NumField()+len(ignoredConfigKeys))
+	for key := range ignoredConfigKeys {
+		known[key] = struct{}{}
+	}
 
 	for i := 0; i < valueType.NumField(); i++ {
 		field := valueType.Field(i)
@@ -45,6 +74,7 @@ func decodeConfigJSONInto(dst any, raw []byte) (map[string]bool, error) {
 		if tag == "" || tag == "-" {
 			continue
 		}
+		known[tag] = struct{}{}
 
 		rawValue, ok := doc[tag]
 		if !ok {
@@ -60,8 +90,62 @@ func decodeConfigJSONInto(dst any, raw []byte) (map[string]bool, error) {
 		}
 		defined[field.Name] = true
 	}
+	for key := range doc {
+		if _, ok := known[key]; !ok {
+			return nil, fmt.Errorf("unknown JSON config key %q", key)
+		}
+	}
 
 	return defined, nil
+}
+
+func decodeUniqueJSONObject(raw []byte) (map[string]json.RawMessage, error) {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	token, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	if token != json.Delim('{') {
+		return nil, fmt.Errorf("config root must be a JSON object")
+	}
+	doc := make(map[string]json.RawMessage)
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return nil, fmt.Errorf("object key is not a string")
+		}
+		if _, duplicate := doc[key]; duplicate {
+			return nil, fmt.Errorf("duplicate JSON config key %q", key)
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, err
+		}
+		doc[key] = value
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return nil, fmt.Errorf("unexpected trailing JSON")
+		}
+		return nil, err
+	}
+	return doc, nil
+}
+
+func rejectUnknownTOML(meta toml.MetaData) error {
+	for _, key := range meta.Undecoded() {
+		if _, ok := ignoredConfigKeys[key.String()]; !ok {
+			return fmt.Errorf("unknown TOML config key %q", key.String())
+		}
+	}
+	return nil
 }
 
 func decodeJSONFieldInto(target reflect.Value, raw json.RawMessage) error {
@@ -123,9 +207,15 @@ func decodeBase64ConfigJSON(encoded string) ([]byte, error) {
 	if trimmed == "" {
 		return nil, fmt.Errorf("empty JSON base64 payload")
 	}
+	if base64.StdEncoding.DecodedLen(len(trimmed)) > maxConfigBytes {
+		return nil, fmt.Errorf("decoded JSON config exceeds the %d-byte size limit", maxConfigBytes)
+	}
 	raw, err := base64.StdEncoding.DecodeString(trimmed)
 	if err != nil {
 		return nil, err
+	}
+	if len(raw) > maxConfigBytes {
+		return nil, fmt.Errorf("decoded JSON config exceeds the %d-byte size limit", maxConfigBytes)
 	}
 	return raw, nil
 }
@@ -143,7 +233,7 @@ func resolveConfigPathWithJSONFallback(filename string) (string, configSourceFor
 		return path, configSourceTOML, nil
 	}
 
-	jsonPath := path
+	var jsonPath string
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".toml":
 		jsonPath = strings.TrimSuffix(path, filepath.Ext(path)) + ".json"

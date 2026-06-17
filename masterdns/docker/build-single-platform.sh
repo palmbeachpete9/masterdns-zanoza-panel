@@ -15,16 +15,24 @@ if [[ -z "${IMAGE_NAME}" ]]; then
 fi
 
 # ===== Defaults =====
-TAG="${TAG:-latest}"
-RELEASE_TAG="${RELEASE_TAG:-latest}"
-RELEASE_SHA256="${RELEASE_SHA256:-}"
+TAG="${TAG:?set TAG to an immutable release tag}"
+RELEASE_TAG="${RELEASE_TAG:?set RELEASE_TAG to an immutable release tag}"
+RELEASE_SHA256="${RELEASE_SHA256:?set RELEASE_SHA256 for the release archive}"
+[[ "${TAG}" != "latest" && "${RELEASE_TAG}" != "latest" ]] || { echo "Mutable latest tags are forbidden" >&2; exit 1; }
+
+case "$(docker version --format '{{.Server.Arch}}')" in
+  amd64) SHA_ARG=RELEASE_SHA256_AMD64 ;;
+  arm64) SHA_ARG=RELEASE_SHA256_ARM64 ;;
+  arm) SHA_ARG=RELEASE_SHA256_ARMV7 ;;
+  *) echo "Unsupported local Docker architecture" >&2; exit 1 ;;
+esac
 
 # ===== Build (local only) =====
 docker build \
   --build-arg RELEASE_TAG="${RELEASE_TAG}" \
-  --build-arg RELEASE_SHA256="${RELEASE_SHA256}" \
+  --build-arg "${SHA_ARG}=${RELEASE_SHA256}" \
   -t "${IMAGE_NAME}:${TAG}" \
-  -f Dockerfile \
-  .
+  -f docker/Dockerfile \
+  ..
 
 echo "Local image built successfully: ${IMAGE_NAME}:${TAG}"

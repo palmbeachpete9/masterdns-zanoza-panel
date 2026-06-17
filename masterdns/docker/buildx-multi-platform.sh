@@ -4,11 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
-RELEASE_TAG="${RELEASE_TAG:-latest}"
+RELEASE_TAG="${RELEASE_TAG:?set RELEASE_TAG to an immutable release tag}"
 PLATFORMS="${PLATFORMS:-linux/amd64,linux/arm/v5,linux/arm/v7,linux/arm64/v8,linux/mips64le}"
 REGISTRY_KIND="${REGISTRY_KIND:-ghcr}"
-IMAGE_REFS_CSV="${IMAGE_REFS:-masterking32/masterdnsvpn:latest}"
-RELEASE_SHA256="${RELEASE_SHA256:-}"
+IMAGE_REFS_CSV="${IMAGE_REFS:?set IMAGE_REFS to immutable release tags}"
+RELEASE_SHA256_AMD64="${RELEASE_SHA256_AMD64:?set RELEASE_SHA256_AMD64}"
+RELEASE_SHA256_ARM64="${RELEASE_SHA256_ARM64:?set RELEASE_SHA256_ARM64}"
+RELEASE_SHA256_ARMV5="${RELEASE_SHA256_ARMV5:?set RELEASE_SHA256_ARMV5}"
+RELEASE_SHA256_ARMV7="${RELEASE_SHA256_ARMV7:?set RELEASE_SHA256_ARMV7}"
+RELEASE_SHA256_MIPS64LE="${RELEASE_SHA256_MIPS64LE:?set RELEASE_SHA256_MIPS64LE}"
+[[ "${RELEASE_TAG}" != "latest" ]] || { echo "Mutable latest release tag is forbidden" >&2; exit 1; }
 
 if ! docker buildx version >/dev/null 2>&1; then
   echo "docker buildx is required" >&2
@@ -45,9 +50,10 @@ for RAW_REF in "${RAW_REFS[@]}"; do
     echo "Invalid image ref: ${REF}" >&2
     exit 1
   fi
-  if [[ "${REF}" != *:* ]]; then
-    REF="${REF}:latest"
-  fi
+  LAST_COMPONENT="${REF##*/}"
+  [[ "${LAST_COMPONENT}" == *:* ]] || { echo "Image ref must contain an immutable release tag: ${REF}" >&2; exit 1; }
+  IMAGE_TAG="${LAST_COMPONENT##*:}"
+  [[ -n "${IMAGE_TAG}" && "${IMAGE_TAG}" != "latest" ]] || { echo "Mutable/empty image tag is forbidden: ${REF}" >&2; exit 1; }
   IMAGE_REFS+=("${REF}")
 done
 
@@ -81,11 +87,15 @@ done
 docker buildx build \
   --platform "${PLATFORMS}" \
   --build-arg RELEASE_TAG="${RELEASE_TAG}" \
-  --build-arg RELEASE_SHA256="${RELEASE_SHA256}" \
+  --build-arg RELEASE_SHA256_AMD64="${RELEASE_SHA256_AMD64}" \
+  --build-arg RELEASE_SHA256_ARM64="${RELEASE_SHA256_ARM64}" \
+  --build-arg RELEASE_SHA256_ARMV5="${RELEASE_SHA256_ARMV5}" \
+  --build-arg RELEASE_SHA256_ARMV7="${RELEASE_SHA256_ARMV7}" \
+  --build-arg RELEASE_SHA256_MIPS64LE="${RELEASE_SHA256_MIPS64LE}" \
   "${TAG_ARGS[@]}" \
-  -f Dockerfile \
+  -f docker/Dockerfile \
   --push \
-  .
+  ..
 
 echo
 echo "Build and push completed:"

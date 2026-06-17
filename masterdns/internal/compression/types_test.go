@@ -71,3 +71,14 @@ func TestDecompressZSTDDecoderCanBeReusedFromPool(t *testing.T) {
 		}
 	}
 }
+
+func TestDecompressZSTDRejectsOversizedOutput(t *testing.T) {
+	data := bytes.Repeat([]byte("z"), maxDecompressedSize+1)
+	compressed, err := compressZSTD(data)
+	if err != nil {
+		t.Fatalf("compressZSTD failed: %v", err)
+	}
+	if _, err := decompressZSTD(compressed); err == nil {
+		t.Fatal("zstd payload beyond the decompressed-size limit was accepted")
+	}
+}

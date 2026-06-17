@@ -93,3 +93,22 @@ func TestShouldUseColorHonorsNoColor(t *testing.T) {
 		t.Fatal("NO_COLOR should disable colors even when FORCE_COLOR is set")
 	}
 }
+
+func TestNewWithFileTightensExistingLogPermissions(t *testing.T) {
+	path := t.TempDir() + "/server.log"
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := NewWithFile("test", "info", path)
+	if l.fileWriter == nil {
+		t.Fatal("expected file logger")
+	}
+	defer func() { _ = l.fileWriter.Close() }()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("log mode = %o, want 600", info.Mode().Perm())
+	}
+}

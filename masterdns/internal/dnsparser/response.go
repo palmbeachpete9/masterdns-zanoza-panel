@@ -204,27 +204,6 @@ func extractQuestionSection(request []byte, header Header) ([]byte, uint16, int)
 	return request[dnsHeaderSize:offset], header.QDCount, offset
 }
 
-func extractOPTRecordsFromRequest(request []byte, header Header, canWalk bool) ([][]byte, int) {
-	if !canWalk || header.ARCount == 0 {
-		return nil, 0
-	}
-
-	offset, err := skipQuestions(request, dnsHeaderSize, int(header.QDCount))
-	if err != nil {
-		return nil, 0
-	}
-
-	return extractOPTRecordsFromOffset(request, header, offset)
-}
-
-func extractOPTRecordsFromOffset(request []byte, header Header, questionEndOffset int) ([][]byte, int) {
-	start, length := findOPTRecordRange(request, header, questionEndOffset)
-	if length == 0 {
-		return nil, 0
-	}
-	return [][]byte{request[start : start+length]}, length
-}
-
 func findOPTRecordRange(request []byte, header Header, questionEndOffset int) (int, int) {
 	if header.ARCount == 0 || questionEndOffset < dnsHeaderSize || questionEndOffset > len(request) {
 		return 0, 0
@@ -314,43 +293,6 @@ func skipResourceRecords(data []byte, offset, count int) (int, error) {
 	}
 
 	return offset, nil
-}
-
-func extractRawOPTRecords(data []byte, offset, count int) ([][]byte, int, int, error) {
-	if count == 0 {
-		return nil, 0, offset, nil
-	}
-
-	records := make([][]byte, 0, count)
-	recordsLen := 0
-	for range count {
-		recordStart := offset
-
-		nextOffset, err := skipName(data, offset)
-		if err != nil {
-			return nil, 0, offset, ErrInvalidAnswer
-		}
-		if nextOffset+10 > len(data) {
-			return nil, 0, offset, ErrInvalidAnswer
-		}
-
-		recordType := binary.BigEndian.Uint16(data[nextOffset : nextOffset+2])
-		rdLen := int(binary.BigEndian.Uint16(data[nextOffset+8 : nextOffset+10]))
-		recordEnd := nextOffset + 10 + rdLen
-		if recordEnd > len(data) {
-			return nil, 0, offset, ErrInvalidAnswer
-		}
-
-		if recordType == Enums.DNS_RECORD_TYPE_OPT {
-			record := data[recordStart:recordEnd]
-			records = append(records, record)
-			recordsLen += len(record)
-		}
-
-		offset = recordEnd
-	}
-
-	return records, recordsLen, offset, nil
 }
 
 func skipName(data []byte, offset int) (int, error) {

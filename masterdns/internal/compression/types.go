@@ -73,7 +73,15 @@ var (
 	}
 	zstdDecoderPool = sync.Pool{
 		New: func() any {
-			decoder, _ := zstd.NewReader(nil)
+			decoder, err := zstd.NewReader(
+				nil,
+				zstd.WithDecoderConcurrency(1),
+				zstd.WithDecoderMaxMemory(maxDecompressedSize),
+				zstd.WithDecoderMaxWindow(maxDecompressedSize),
+			)
+			if err != nil {
+				panic(err)
+			}
 			return decoder
 		},
 	}
@@ -214,7 +222,10 @@ func compressZLIB(data []byte) ([]byte, error) {
 func decompressZLIB(data []byte) ([]byte, error) {
 	reader := bytes.NewReader(data)
 	stream := deflateReaderPool.Get().(io.ReadCloser)
-	stream.(flate.Resetter).Reset(reader, nil)
+	if err := stream.(flate.Resetter).Reset(reader, nil); err != nil {
+		deflateReaderPool.Put(stream)
+		return nil, err
+	}
 	defer deflateReaderPool.Put(stream)
 
 	buffer := deflateBufferPool.Get().(*bytes.Buffer)

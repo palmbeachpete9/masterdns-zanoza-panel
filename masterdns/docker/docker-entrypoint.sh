@@ -6,19 +6,28 @@ DATA_DIR="${DATA_DIR:-/data}"
 CONFIG_FILE="${CONFIG_FILE:-server_config.toml}"
 KEY_FILE="${KEY_FILE:-encrypt_key.txt}"
 BIN="${APP_DIR}/masterdnsvpn"
-# Overridable so operators can pin an immutable ref (or mount /data config and
-# avoid the runtime download of mutable repository content entirely) (V4-08).
-SAMPLE_URL="${SAMPLE_URL:-https://raw.githubusercontent.com/masterking32/MasterDnsVPN/main/server_config.toml.simple}"
+SAMPLE_CONFIG="${APP_DIR}/server_config.toml.simple"
 
-mkdir -p "${APP_DIR}" "${DATA_DIR}"
-cd "${APP_DIR}"
+valid_file_name() {
+  [[ ${#1} -le 255 && "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]
+}
+if ! valid_file_name "${CONFIG_FILE}" || ! valid_file_name "${KEY_FILE}"; then
+  echo "CONFIG_FILE and KEY_FILE must be simple file names." >&2
+  exit 1
+fi
 
-copy_if_exists() {
-  local src="$1"
-  local dst="$2"
-  if [[ -f "${src}" ]]; then
-    cp -f "${src}" "${dst}"
-  fi
+mkdir -p "${DATA_DIR}"
+cd "${DATA_DIR}"
+
+valid_dns_domain() {
+  local domain="$1" label
+  [[ ${#domain} -le 253 && "$domain" == *.* ]] || return 1
+  case "$domain" in *[!A-Za-z0-9.-]*|.*|*.|*..*) return 1;; esac
+  IFS='.' read -r -a labels <<< "$domain"
+  for label in "${labels[@]}"; do
+    [[ -n "$label" && ${#label} -le 63 ]] || return 1
+    case "$label" in -*|*-) return 1;; esac
+  done
 }
 
 bootstrap_config() {
@@ -29,16 +38,23 @@ bootstrap_config() {
     echo "ERROR: DOMAIN env is required when /data/${CONFIG_FILE} does not exist." >&2
     exit 1
   fi
+  valid_dns_domain "${domain_value}" || { echo "ERROR: DOMAIN must be a valid DNS domain." >&2; exit 1; }
 
-  tmp_config="$(mktemp)"
+  [[ -f "${SAMPLE_CONFIG}" ]] || { echo "Missing baked sample config: ${SAMPLE_CONFIG}" >&2; exit 1; }
+  tmp_config="$(mktemp "${DATA_DIR}/config.XXXXXX")"
   trap 'rm -f "${tmp_config}"' EXIT
 
-  curl -fsSL --retry 3 --retry-delay 2 "${SAMPLE_URL}" -o "${tmp_config}"
-
   domain_value="${domain_value//&/\\&}"
-  sed -E "s|^DOMAIN[[:space:]]*=.*$|DOMAIN = [\"${domain_value}\"]|" "${tmp_config}" > "${APP_DIR}/${CONFIG_FILE}"
-  cp -f "${APP_DIR}/${CONFIG_FILE}" "${DATA_DIR}/${CONFIG_FILE}" 2>/dev/null || true
-  rm -f "${tmp_config}"
+  sed -E \
+    -e "s|^DOMAIN[[:space:]]*=.*$|DOMAIN = [\"${domain_value}\"]|" \
+    -e "s|^ENCRYPTION_KEY_FILE[[:space:]]*=.*$|ENCRYPTION_KEY_FILE = \"${KEY_FILE}\"|" \
+    "${SAMPLE_CONFIG}" > "${tmp_config}"
+  grep -q "^ENCRYPTION_KEY_FILE = \"${KEY_FILE}\"$" "${tmp_config}" || {
+    echo "Sample config has no ENCRYPTION_KEY_FILE setting." >&2
+    exit 1
+  }
+  chmod 0600 "${tmp_config}"
+  mv -f "${tmp_config}" "${DATA_DIR}/${CONFIG_FILE}"
   trap - EXIT
 }
 
@@ -47,17 +63,13 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-# Prefer persisted config/key if present.
-copy_if_exists "${DATA_DIR}/${CONFIG_FILE}" "${APP_DIR}/${CONFIG_FILE}"
-copy_if_exists "${DATA_DIR}/${KEY_FILE}" "${APP_DIR}/${KEY_FILE}"
-
-if [[ ! -f "${APP_DIR}/${CONFIG_FILE}" ]]; then
+if [[ ! -f "${DATA_DIR}/${CONFIG_FILE}" ]]; then
   bootstrap_config
 fi
 
-if [[ ! -s "${APP_DIR}/${KEY_FILE}" ]]; then
+if ! grep -Eq '^[[:space:]]*KEYRING_FILE[[:space:]]*=[[:space:]]*"[^"]+"' "${DATA_DIR}/${CONFIG_FILE}"; then
   tmp_log="$(mktemp)"
-  if ! "${BIN}" -genkey -nowait >"${tmp_log}" 2>&1; then
+  if ! "${BIN}" -config "${DATA_DIR}/${CONFIG_FILE}" -genkey -nowait >"${tmp_log}" 2>&1; then
     tail -n 100 "${tmp_log}" >&2 || true
     rm -f "${tmp_log}"
     exit 1
@@ -65,7 +77,4 @@ if [[ ! -s "${APP_DIR}/${KEY_FILE}" ]]; then
   rm -f "${tmp_log}"
 fi
 
-cp -f "${APP_DIR}/${CONFIG_FILE}" "${DATA_DIR}/${CONFIG_FILE}" 2>/dev/null || true
-cp -f "${APP_DIR}/${KEY_FILE}" "${DATA_DIR}/${KEY_FILE}" 2>/dev/null || true
-
-exec "${BIN}" -nowait "$@"
+exec "${BIN}" -config "${DATA_DIR}/${CONFIG_FILE}" -nowait "$@"

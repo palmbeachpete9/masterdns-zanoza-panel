@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/config"
+
 	Enums "masterdnsvpn-go/internal/enums"
 	fragmentStore "masterdnsvpn-go/internal/fragmentstore"
 	VpnProto "masterdnsvpn-go/internal/vpnproto"
@@ -132,9 +133,9 @@ func TestProcessDeferredStreamSynQueuesConnectedAndEnablesIO(t *testing.T) {
 	s.sessions.byID[record.ID] = record
 
 	local, remote := net.Pipe()
-	defer remote.Close()
+	defer func() { _ = remote.Close() }()
 
-	s.dialStreamUpstreamFn = func(network, address string, timeoutSeconds time.Duration) (net.Conn, error) {
+	s.dialStreamUpstreamFn = func(network, address string, timeout time.Duration) (net.Conn, error) {
 		return local, nil
 	}
 
@@ -541,6 +542,67 @@ func TestDeferredSessionProcessorClearsLaneMappingAfterTaskRun(t *testing.T) {
 	t.Fatal("expected laneWorker mapping to be cleared after task completion")
 }
 
+func TestDeferredSessionProcessorSerializesQueuedLaneAfterFirstTaskFinishes(t *testing.T) {
+	processor := newDeferredSessionProcessor(2, 4, nil)
+	if processor == nil {
+		t.Fatal("expected deferred processor")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	processor.Start(ctx)
+
+	lane := deferredSessionLane{sessionID: 8, streamID: 12}
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan struct{})
+	releaseSecond := make(chan struct{})
+	thirdStarted := make(chan struct{})
+
+	if !processor.Enqueue(lane, func(context.Context) {
+		close(firstStarted)
+		<-releaseFirst
+	}) {
+		t.Fatal("expected first task to enqueue")
+	}
+	select {
+	case <-firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first task")
+	}
+	if !processor.Enqueue(lane, func(context.Context) {
+		close(secondStarted)
+		<-releaseSecond
+	}) {
+		t.Fatal("expected second task to enqueue")
+	}
+
+	close(releaseFirst)
+	select {
+	case <-secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for second task")
+	}
+	if !processor.Enqueue(lane, func(context.Context) {
+		close(thirdStarted)
+	}) {
+		t.Fatal("expected third task to enqueue")
+	}
+
+	select {
+	case <-thirdStarted:
+		t.Fatal("third task ran concurrently with the lane's second task")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseSecond)
+	select {
+	case <-thirdStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for third task after lane was released")
+	}
+}
+
 func TestDeferredSessionProcessorRemoveLaneCancelsRunningTask(t *testing.T) {
 	processor := newDeferredSessionProcessor(1, 2, nil)
 	if processor == nil {
@@ -702,6 +764,58 @@ func TestDeferredSessionProcessorCompactKeepsCancelledMarkerForInFlightTask(t *t
 	default:
 		t.Fatal("expected beginTaskContext to see preserved cancelled marker")
 	}
+}
+
+func TestDeferredSessionProcessorSkipsCancelledDequeuedTask(t *testing.T) {
+	processor := newDeferredSessionProcessor(1, 4, nil)
+	if processor == nil {
+		t.Fatal("expected deferred processor")
+	}
+
+	lane := deferredSessionLane{sessionID: 15, streamID: 4}
+	ran := make(chan struct{}, 1)
+
+	processor.mu.Lock()
+	processor.cancelled[lane] = struct{}{}
+	processor.laneWorker[lane] = 0
+	processor.lanePending[lane] = 1
+	processor.sessionPending[lane.sessionID] = 1
+	processor.workers[0].pending.Store(1)
+	processor.workers[0].jobs <- deferredSessionTask{
+		lane: lane,
+		run: func(context.Context) {
+			ran <- struct{}{}
+		},
+	}
+	processor.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	processor.Start(ctx)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case <-ran:
+			t.Fatal("cancelled deferred task should not run after dequeue")
+		default:
+		}
+
+		processor.mu.Lock()
+		pending := processor.workers[0].pending.Load()
+		_, cancelled := processor.cancelled[lane]
+		_, mapped := processor.laneWorker[lane]
+		_, lanePending := processor.lanePending[lane]
+		sessionPending := processor.sessionPending[lane.sessionID]
+		processor.mu.Unlock()
+
+		if pending == 0 && !cancelled && !mapped && !lanePending && sessionPending == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("timed out waiting for cancelled deferred task cleanup")
 }
 
 func TestInvalidSessionDropLogConfigRecentlyClosedIgnoresReceivedCookie(t *testing.T) {
@@ -912,6 +1026,16 @@ func TestDialTCPTargetContextPassesEffectiveDeadlineToDialer(t *testing.T) {
 	_, _ = s.dialTCPTargetContext(ctx, "149.154.167.92:443")
 	if received <= 0 || received > 200*time.Millisecond {
 		t.Fatalf("expected effective dial timeout to follow context deadline, got %s", received)
+	}
+}
+
+func TestDialTCPTargetContextAcceptsNilContext(t *testing.T) {
+	s := newTestServerForStreamSyn("TCP")
+	s.dialStreamUpstreamFn = func(_, _ string, _ time.Duration) (net.Conn, error) {
+		return nil, errors.New("dial failed")
+	}
+	if _, err := s.dialTCPTargetContext(nil, "127.0.0.1:1"); err == nil { //nolint:staticcheck // Regression test for the documented nil-context fallback.
+		t.Fatal("expected dial error")
 	}
 }
 

@@ -185,6 +185,45 @@ ENCRYPTION_KEY = "secret"
 	}
 }
 
+func TestLoadClientConfigClampsDirectResourceSizingFields(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "client_config.toml")
+	resolversPath := filepath.Join(dir, "client_resolvers.txt")
+
+	if err := os.WriteFile(configPath, []byte(`
+PROTOCOL_TYPE = "SOCKS5"
+DOMAINS = ["v.domain.com"]
+LOCAL_DNS_CACHE_MAX_RECORDS = 2147483647
+COMPRESSION_MIN_SIZE = 2147483647
+MTU_TEST_RETRIES = 2147483647
+MTU_TEST_PARALLELISM = 2147483647
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY = "secret"
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	if err := os.WriteFile(resolversPath, []byte("8.8.8.8\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile resolvers failed: %v", err)
+	}
+
+	cfg, err := LoadClientConfig(configPath)
+	if err != nil {
+		t.Fatalf("LoadClientConfig returned error: %v", err)
+	}
+	if cfg.LocalDNSCacheMaxRecords != 500000 {
+		t.Fatalf("unexpected local dns records clamp: got=%d want=500000", cfg.LocalDNSCacheMaxRecords)
+	}
+	if cfg.CompressionMinSize != int(^uint16(0)) {
+		t.Fatalf("unexpected compression min size clamp: got=%d want=%d", cfg.CompressionMinSize, int(^uint16(0)))
+	}
+	if cfg.MTUTestRetries != 100 {
+		t.Fatalf("unexpected MTU retries clamp: got=%d want=100", cfg.MTUTestRetries)
+	}
+	if cfg.MTUTestParallelism != 24 || cfg.EffectiveMTUTestParallelism() != 24 {
+		t.Fatalf("unexpected MTU parallelism clamp: configured=%d effective=%d want=24", cfg.MTUTestParallelism, cfg.EffectiveMTUTestParallelism())
+	}
+}
+
 func TestLoadClientConfigAllowsUsernameOnlySocksAuth(t *testing.T) {
 	dir := t.TempDir()
 
@@ -397,6 +436,39 @@ MAX_DOWNLOAD_MTU = 140
 	}
 	if cfg.MinUploadMTU != minUp || cfg.MaxUploadMTU != maxUp || cfg.MinDownloadMTU != minDown || cfg.MaxDownloadMTU != maxDown {
 		t.Fatalf("unexpected overridden MTU range: up=%d..%d down=%d..%d", cfg.MinUploadMTU, cfg.MaxUploadMTU, cfg.MinDownloadMTU, cfg.MaxDownloadMTU)
+	}
+}
+
+func TestLoadClientConfigWithOverridesRXTXWinsOverLegacyWorkers(t *testing.T) {
+	dir := t.TempDir()
+
+	configPath := filepath.Join(dir, "client_config.toml")
+	resolversPath := filepath.Join(dir, "client_resolvers.txt")
+
+	if err := os.WriteFile(configPath, []byte(`
+PROTOCOL_TYPE = "SOCKS5"
+DOMAINS = ["v.domain.com"]
+DATA_ENCRYPTION_METHOD = 1
+ENCRYPTION_KEY = "secret"
+TUNNEL_READER_WORKERS = 32
+TUNNEL_WRITER_WORKERS = 48
+`), 0o644); err != nil {
+		t.Fatalf("WriteFile config failed: %v", err)
+	}
+	if err := os.WriteFile(resolversPath, []byte("8.8.8.8\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile resolvers failed: %v", err)
+	}
+
+	cfg, err := LoadClientConfigWithOverrides(configPath, ClientConfigOverrides{
+		Values: map[string]any{
+			"RX_TX_Workers": 7,
+		},
+	})
+	if err != nil {
+		t.Fatalf("LoadClientConfigWithOverrides returned error: %v", err)
+	}
+	if cfg.RX_TX_Workers != 7 {
+		t.Fatalf("RX_TX_Workers override was ignored: got=%d want=7", cfg.RX_TX_Workers)
 	}
 }
 

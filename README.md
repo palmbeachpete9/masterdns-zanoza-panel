@@ -22,10 +22,15 @@
 
 ## Установка
 
-Ubuntu / Debian VPS, от root:
+Для привилегированной установки требуется проверенный полный SHA коммита.
+Сначала скачайте и проверьте установщик; не передавайте содержимое изменяемой
+ветки напрямую в root shell:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
+git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
+cd masterdns-zanoza-panel
+git checkout --detach <AUDITED_FULL_COMMIT_SHA>
+sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
 ```
 
 Установщик (в стиле 3x-ui) спросит:
@@ -36,6 +41,11 @@ curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-pan
    - **1) IP-сертификат** — self-signed на IP сервера, срок 6 дней, автопродление (systemd-таймер).
    - **2) Доменный сертификат** Let's Encrypt — нужна A-запись `panel.example.com` → IP сервера.
    - **3) Без сертификата** — панель слушает **только** на `127.0.0.1` (внешний доступ через nginx/SSH-туннель).
+
+Для TLS-терминирующего reverse proxy задайте при установке точный внешний
+origin в `ZANOZA_EXTERNAL_ORIGIN` и IP/CIDR прокси в
+`ZANOZA_TRUSTED_PROXIES`. Заголовок `X-Forwarded-For` принимается только от
+доверенных прокси.
 
 После установки генерируются **логин (10 символов)** и **пароль (20 символов)** и выводится полный адрес панели, в зависимости от выбора в п.1-3.
 
@@ -87,7 +97,9 @@ masterdns-zanoza-panel/
 
 | Переменная | Назначение | По умолчанию |
 |---|---|---|
-| `ZANOZA_CONFIG` | Путь к JSON-конфигу панели | `/etc/zanoza-panel/config.json` |
+| `ZANOZA_CONFIG` | Путь к JSON-конфигу панели | `/var/lib/zanoza-panel/config.json` |
+| `ZANOZA_EXTERNAL_ORIGIN` | Точный внешний origin прокси | пусто |
+| `ZANOZA_TRUSTED_PROXIES` | Список доверенных IP/CIDR прокси | пусто |
 | `ZANOZA_RUNTIME_DIR` | Директория для keyring.json и server_config.toml | `<configDir>/masterdns` |
 | `ZANOZA_PANEL_ADDR` | IP-адрес для HTTP-сервера | из `config.json` |
 | `ZANOZA_PANEL_PORT` | Порт панели (1–65535) | из `config.json` |

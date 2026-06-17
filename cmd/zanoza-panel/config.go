@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+)
+
+const (
+	maxPanelConfigBytes = 32 << 20
+	maxInstances        = 4096
 )
 
 // Instance is one (domain, key, method) tuple handed to a user.
@@ -77,12 +84,11 @@ func (c *Config) Meta() ConfigMeta {
 }
 
 func loadConfig(path string) (*Config, error) {
-	cfg := defaultConfig()
-	cfg.path = path
-
-	raw, err := os.ReadFile(path)
+	raw, err := readFileLimited(path, maxPanelConfigBytes)
 	if err != nil {
 		if os.IsNotExist(err) {
+			cfg := defaultConfig()
+			cfg.path = path
 			if err := cfg.save(); err != nil {
 				return nil, err
 			}
@@ -90,11 +96,20 @@ func loadConfig(path string) (*Config, error) {
 		}
 		return nil, err
 	}
-	if err := json.Unmarshal(raw, cfg); err != nil {
+	return parseConfig(path, raw)
+}
+
+func parseConfig(path string, raw []byte) (*Config, error) {
+	cfg := defaultConfig()
+	cfg.path = path
+	if err := decodePanelConfig(raw, cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	cfg.path = path
 	cfg.normalize()
+	if err := cfg.validateRuntime(); err != nil {
+		return nil, fmt.Errorf("invalid config %s: %w", path, err)
+	}
 	// Canonicalize + validate every persisted instance, so legacy/hand-edited
 	// configs cannot smuggle canonical-collision domains past the runtime rules
 	// (F06). Fail closed: an unsafe config refuses to start.
@@ -104,10 +119,139 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// decodePanelConfig rejects unknown fields, duplicate object keys at any
+// nesting level, non-object roots, and trailing JSON. Silently accepting a
+// misspelled or shadowed security/runtime setting can otherwise start the panel
+// with an unintended default.
+func decodePanelConfig(raw []byte, cfg *Config) error {
+	if err := decodeStrictJSONObject(raw, cfg); err != nil {
+		return err
+	}
+	var envelope struct {
+		Version *int `json:"version"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return err
+	}
+	if envelope.Version == nil || *envelope.Version != 1 {
+		if envelope.Version == nil {
+			return fmt.Errorf("config version is required")
+		}
+		return fmt.Errorf("unsupported config version %d", *envelope.Version)
+	}
+	return nil
+}
+
+func decodeStrictJSONObject(raw []byte, dst any) error {
+	if err := rejectDuplicateJSONKeys(raw); err != nil {
+		return err
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return fmt.Errorf("unexpected trailing JSON")
+	}
+	return nil
+}
+
+func rejectDuplicateJSONKeys(raw []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	first, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if first != json.Delim('{') {
+		return fmt.Errorf("config root must be a JSON object")
+	}
+	if err := scanJSONObject(dec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON")
+		}
+		return err
+	}
+	return nil
+}
+
+func scanJSONObject(dec *json.Decoder) error {
+	seen := make(map[string]struct{})
+	for dec.More() {
+		token, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, ok := token.(string)
+		if !ok {
+			return fmt.Errorf("object key is not a string")
+		}
+		foldedKey := strings.ToLower(key)
+		if _, duplicate := seen[foldedKey]; duplicate {
+			return fmt.Errorf("duplicate JSON key %q", key)
+		}
+		seen[foldedKey] = struct{}{}
+		if err := scanJSONValue(dec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func scanJSONValue(dec *json.Decoder) error {
+	token, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		if err := scanJSONObject(dec); err != nil {
+			return err
+		}
+		_, err = dec.Token()
+		return err
+	case '[':
+		for dec.More() {
+			if err := scanJSONValue(dec); err != nil {
+				return err
+			}
+		}
+		_, err = dec.Token()
+		return err
+	default:
+		return fmt.Errorf("unexpected JSON delimiter %q", delim)
+	}
+}
+
+// loadExistingConfig is used for runtime reloads. A missing configuration is
+// an error here: recreating an empty first-run config during SIGHUP would
+// discard the live instance set and stop the supervised DNS server.
+func loadExistingConfig(path string) (*Config, error) {
+	raw, err := readFileLimited(path, maxPanelConfigBytes)
+	if err != nil {
+		return nil, err
+	}
+	return parseConfig(path, raw)
+}
+
 // canonicalizeAndValidateInstances rewrites every instance domain to its
 // canonical form and re-runs the multi-key/dup-key validation across the whole
 // set (F06).
 func (c *Config) canonicalizeAndValidateInstances() error {
+	if len(c.Instances) > maxInstances {
+		return fmt.Errorf("instance count %d exceeds limit %d", len(c.Instances), maxInstances)
+	}
 	// IDs must be non-empty and unique; otherwise validateInstance's "skip
 	// siblings with my ID" rule lets two same-ID records hide each other and
 	// bypass the multi-key/dup-key checks (R-05).
@@ -121,12 +265,17 @@ func (c *Config) canonicalizeAndValidateInstances() error {
 			return fmt.Errorf("duplicate instance id %q", id)
 		}
 		seen[id] = struct{}{}
+		c.Instances[i].ID = id
 
 		d, err := canonicalDomain(c.Instances[i].Domain)
 		if err != nil {
 			return fmt.Errorf("instance %q: %w", id, err)
 		}
 		c.Instances[i].Domain = d
+		// MasterDNS canonicalizes keyring keys with TrimSpace before deriving
+		// crypto state. Persist and share that same canonical value so the panel,
+		// server, and generated zanoza:// profile can never disagree.
+		c.Instances[i].Key = strings.TrimSpace(c.Instances[i].Key)
 	}
 	for _, ins := range c.Instances {
 		if err := validateInstance(c.Instances, ins, ins.ID); err != nil {
@@ -137,13 +286,8 @@ func (c *Config) canonicalizeAndValidateInstances() error {
 }
 
 func (c *Config) normalize() {
-	if c.Version == 0 {
-		c.Version = 1
-	}
 	if p, err := normalizePanelPath(c.PanelPath); err == nil {
 		c.PanelPath = p
-	} else {
-		c.PanelPath = "/admin"
 	}
 	if c.Name == "" {
 		c.Name = "Zanoza Panel"
@@ -154,6 +298,24 @@ func (c *Config) normalize() {
 	if c.Instances == nil {
 		c.Instances = []Instance{}
 	}
+}
+
+func (c *Config) validateRuntime() error {
+	if c.Version != 1 {
+		return fmt.Errorf("unsupported config version %d", c.Version)
+	}
+	p, err := normalizePanelPath(c.PanelPath)
+	if err != nil {
+		return fmt.Errorf("invalid panel_path: %w", err)
+	}
+	c.PanelPath = p
+	if c.PanelPort < 1 || c.PanelPort > 65535 {
+		return fmt.Errorf("panel_port must be in 1..65535")
+	}
+	if strings.TrimSpace(c.PanelAddr) == "" {
+		return fmt.Errorf("panel_addr is required")
+	}
+	return nil
 }
 
 // normalizePanelPath returns the canonical admin path or an error. It enforces
@@ -190,13 +352,20 @@ func (c *Config) save() error {
 	// Callers never hold c.mu when calling save(), so this cannot deadlock.
 	c.mu.Lock()
 	c.normalize()
-	raw, err := json.MarshalIndent(c, "", "  ")
+	err := c.validateRuntime()
+	var raw []byte
+	if err == nil {
+		raw, err = json.MarshalIndent(c, "", "  ")
+	}
 	path := c.path
 	c.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if len(raw) > maxPanelConfigBytes {
+		return fmt.Errorf("serialized config exceeds the %d-byte size limit", maxPanelConfigBytes)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	// Atomic + durable write via a unique temp file, so concurrent saves no
@@ -231,11 +400,17 @@ func (c *Config) commit(mutate func(work *Config) error) error {
 		return err
 	}
 	work.normalize()
+	if err := work.validateRuntime(); err != nil {
+		return err
+	}
 	raw, err := json.MarshalIndent(work, "", "  ")
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(work.path), 0o755); err != nil {
+	if len(raw) > maxPanelConfigBytes {
+		return fmt.Errorf("serialized config exceeds the %d-byte size limit", maxPanelConfigBytes)
+	}
+	if err := os.MkdirAll(filepath.Dir(work.path), 0o700); err != nil {
 		return err
 	}
 	if err := writeFileAtomic(work.path, raw, 0o600); err != nil {

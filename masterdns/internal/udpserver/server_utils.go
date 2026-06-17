@@ -9,23 +9,15 @@ package udpserver
 
 import (
 	"encoding/binary"
-	"fmt"
 
 	"masterdnsvpn-go/internal/compression"
-	DnsParser "masterdnsvpn-go/internal/dnsparser"
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/logger"
+
+	DnsParser "masterdnsvpn-go/internal/dnsparser"
 )
 
 func (s *Server) debugLoggingEnabled() bool {
 	return s != nil && s.log != nil && s.log.Enabled(logger.LevelDebug)
-}
-
-func summarizeQName(name string) string {
-	if len(name) <= 96 {
-		return name
-	}
-	return fmt.Sprintf("%s...%s", name[:48], name[len(name)-24:])
 }
 
 func buildNoDataResponse(packet []byte) []byte {
@@ -50,22 +42,6 @@ func (s *Server) buildNoDataResponseLogged(packet []byte, reason string) []byte 
 
 func (s *Server) buildNoDataResponseLiteLogged(packet []byte, parsed DnsParser.LitePacket, reason string) []byte {
 	return buildNoDataResponseLite(packet, parsed)
-}
-
-func isClosedStreamAwarePacketType(packetType uint8) bool {
-	switch packetType {
-	case Enums.PACKET_STREAM_SYN,
-		Enums.PACKET_STREAM_DATA,
-		Enums.PACKET_STREAM_RESEND,
-		Enums.PACKET_STREAM_DATA_ACK,
-		Enums.PACKET_STREAM_DATA_NACK,
-		Enums.PACKET_STREAM_CLOSE_WRITE,
-		Enums.PACKET_STREAM_CLOSE_READ,
-		Enums.PACKET_STREAM_RST:
-		return true
-	default:
-		return false
-	}
 }
 
 func sessionResponseModeName(mode uint8) string {

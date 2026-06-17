@@ -15,7 +15,8 @@ func TestHandleMTUDownRequestBuildsZeroFilledPayload(t *testing.T) {
 	s := &Server{
 		mtuProbePayloadPool: sync.Pool{
 			New: func() any {
-				return make([]byte, mtuProbeMaxDownSize)
+				buffer := make([]byte, mtuProbeMaxDownSize)
+				return &buffer
 			},
 		},
 	}

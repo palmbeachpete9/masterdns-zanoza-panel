@@ -78,23 +78,26 @@ func (m *Manager[T]) Begin(key string, now time.Time) bool {
 	return leader
 }
 
-func (m *Manager[T]) Resolve(key string, value T, hasValue bool) {
-	if m == nil || key == "" {
-		return
+func (m *Manager[T]) Resolve(key string, expected *Entry[T], value T, hasValue bool) bool {
+	if m == nil || key == "" || expected == nil {
+		return false
 	}
 
 	m.mu.Lock()
 	entry := m.items[key]
+	if entry != expected {
+		m.mu.Unlock()
+		return false
+	}
 	delete(m.items, key)
-	if entry != nil && hasValue {
+	if hasValue {
 		entry.value = m.clone(value)
 		entry.hasValue = true
 	}
 	m.mu.Unlock()
 
-	if entry != nil {
-		close(entry.ready)
-	}
+	close(entry.ready)
+	return true
 }
 
 func (m *Manager[T]) Wait(entry *Entry[T], timeout time.Duration) (T, bool) {

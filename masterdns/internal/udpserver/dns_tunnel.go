@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/dnscache"
+	"masterdnsvpn-go/internal/inflight"
+
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	Enums "masterdnsvpn-go/internal/enums"
-	"masterdnsvpn-go/internal/inflight"
 )
 
 var ErrInvalidDNSUpstream = errors.New("invalid dns upstream")
+
+const maxConcurrentDNSUpstreamQueries = 4
 
 type dnsFragmentKey struct {
 	sessionID   uint8
@@ -45,11 +48,11 @@ func (m *dnsResolveInflightManager) Acquire(cacheKey string, now time.Time) (*dn
 	return m.inner.Acquire(cacheKey, now)
 }
 
-func (m *dnsResolveInflightManager) Resolve(cacheKey string, response []byte) {
+func (m *dnsResolveInflightManager) Resolve(cacheKey string, entry *dnsResolveInflightEntry, response []byte) bool {
 	if m == nil {
-		return
+		return false
 	}
-	m.inner.Resolve(cacheKey, response, len(response) != 0)
+	return m.inner.Resolve(cacheKey, entry, response, len(response) != 0)
 }
 
 func (m *dnsResolveInflightManager) Wait(entry *dnsResolveInflightEntry, timeout time.Duration) ([]byte, bool) {
@@ -162,7 +165,7 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 			sequenceNum,
 		)
 	}
-	s.dnsResolveInflight.Resolve(cacheKey, resolved)
+	currentResolution := s.dnsResolveInflight.Resolve(cacheKey, inflightEntry, resolved)
 	if err != nil || len(resolved) == 0 {
 		if s.log != nil {
 			s.log.Debugf(
@@ -189,15 +192,17 @@ func (s *Server) buildDNSQueryResponsePayload(rawQuery []byte, sessionID uint8, 
 	} else if negSecs, ok := DnsParser.NegativeTTL(resolved); ok {
 		recordTTL = time.Duration(negSecs) * time.Second
 	}
-	s.dnsCache.SetReady(
-		cacheKey,
-		parsed.FirstQuestion.Name,
-		parsed.FirstQuestion.Type,
-		parsed.FirstQuestion.Class,
-		resolved,
-		recordTTL,
-		now,
-	)
+	if currentResolution {
+		s.dnsCache.SetReady(
+			cacheKey,
+			parsed.FirstQuestion.Name,
+			parsed.FirstQuestion.Type,
+			parsed.FirstQuestion.Class,
+			resolved,
+			recordTTL,
+			now,
+		)
+	}
 	if s.log != nil {
 		s.log.Debugf(
 			"🌍 <green>Tunnel DNS Resolved Upstream</green> <magenta>|</magenta> <blue>Domain</blue>: <cyan>%s</cyan> <magenta>|</magenta> <blue>Type</blue>: <yellow>%s</yellow> <magenta>|</magenta> <blue>Session</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Seq</blue>: <cyan>%d</cyan> <magenta>|</magenta> <blue>Bytes</blue>: <cyan>%d</cyan>",
@@ -296,60 +301,53 @@ func (s *Server) resolveDNSUpstream(rawQuery []byte) ([]byte, error) {
 	}
 
 	resultCh := make(chan []byte, len(s.dnsUpstreamServers))
-	launch := func(upstream string) {
+	deadlineAt := time.Now().Add(timeout)
+	next := 0
+	inFlight := 0
+	launchNext := func() bool {
+		if next >= len(s.dnsUpstreamServers) || inFlight >= maxConcurrentDNSUpstreamQueries {
+			return false
+		}
+		remaining := time.Until(deadlineAt)
+		if remaining <= 0 {
+			return false
+		}
+		upstream := s.dnsUpstreamServers[next]
+		next++
+		inFlight++
 		go func(addr string) {
-			resp, err := s.queryOneUpstream(addr, rawQuery, timeout)
+			resp, err := s.queryOneUpstream(addr, rawQuery, remaining)
 			if err == nil && len(resp) > 0 {
 				resultCh <- resp
 				return
 			}
 			resultCh <- nil
 		}(upstream)
+		return true
 	}
 
-	launch(s.dnsUpstreamServers[0])
+	launchNext()
 
 	hedgeDelay := dnsUpstreamHedgeDelay(timeout)
-	hedgeTimer := time.NewTimer(hedgeDelay)
-	defer hedgeTimer.Stop()
+	hedgeTicker := time.NewTicker(hedgeDelay)
+	defer hedgeTicker.Stop()
 
-	deadline := time.NewTimer(timeout)
+	deadline := time.NewTimer(time.Until(deadlineAt))
 	defer deadline.Stop()
 
-	launched := 1
-	received := 0
-	hedged := false
-
-	launchRemaining := func() {
-		if hedged {
-			return
-		}
-		hedged = true
-		for _, upstream := range s.dnsUpstreamServers[1:] {
-			launch(upstream)
-			launched++
-		}
-	}
-
-	for received < launched {
+	for inFlight > 0 {
 		select {
 		case resp := <-resultCh:
-			received++
+			inFlight--
 			if len(resp) > 0 {
 				return resp, nil
 			}
-			// Primary failed early: don't wait for the hedge timer to expire.
-			if !hedged {
-				if !hedgeTimer.Stop() {
-					select {
-					case <-hedgeTimer.C:
-					default:
-					}
-				}
-				launchRemaining()
-			}
-		case <-hedgeTimer.C:
-			launchRemaining()
+			// A failed attempt frees one slot immediately. Continue through every
+			// configured fallback without ever launching the full list at once.
+			launchNext()
+		case <-hedgeTicker.C:
+			// Slow primary: add one hedge per interval, up to the per-request cap.
+			launchNext()
 		case <-deadline.C:
 			return nil, ErrInvalidDNSUpstream
 		}
@@ -387,12 +385,13 @@ func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time
 		return nil, err
 	}
 
-	buffer := s.dnsUpstreamBufferPool.Get().([]byte)
+	bufferPtr := s.dnsUpstreamBufferPool.Get().(*[]byte)
+	buffer := *bufferPtr
 	n, readErr := conn.Read(buffer)
 	_ = conn.Close()
 
 	if readErr != nil || n == 0 {
-		s.dnsUpstreamBufferPool.Put(buffer)
+		s.dnsUpstreamBufferPool.Put(bufferPtr)
 		if readErr == nil {
 			return nil, ErrInvalidDNSUpstream
 		}
@@ -401,15 +400,39 @@ func (s *Server) queryOneUpstream(upstream string, rawQuery []byte, timeout time
 
 	if len(rawQuery) >= 2 && n >= 2 {
 		if buffer[0] != rawQuery[0] || buffer[1] != rawQuery[1] {
-			s.dnsUpstreamBufferPool.Put(buffer)
+			s.dnsUpstreamBufferPool.Put(bufferPtr)
 			return nil, ErrInvalidDNSUpstream
 		}
 	}
 
 	response := make([]byte, n)
 	copy(response, buffer[:n])
-	s.dnsUpstreamBufferPool.Put(buffer)
+	s.dnsUpstreamBufferPool.Put(bufferPtr)
+	if !dnsResponseMatchesQuery(rawQuery, response) {
+		return nil, ErrInvalidDNSUpstream
+	}
 	return response, nil
+}
+
+func dnsResponseMatchesQuery(query, response []byte) bool {
+	request, err := DnsParser.ParseDNSRequestLite(query)
+	if err != nil {
+		return false
+	}
+	answer, err := DnsParser.ParsePacket(response)
+	if err != nil || answer.Header.QR != 1 || answer.Header.ID != request.Header.ID ||
+		answer.Header.OpCode != request.Header.OpCode || answer.Header.QDCount != request.Header.QDCount ||
+		len(answer.Questions) != len(request.Questions) {
+		return false
+	}
+	for i := range request.Questions {
+		if !strings.EqualFold(request.Questions[i].Name, answer.Questions[i].Name) ||
+			request.Questions[i].Type != answer.Questions[i].Type ||
+			request.Questions[i].Class != answer.Questions[i].Class {
+			return false
+		}
+	}
+	return true
 }
 
 func newUDPUpstreamConn(endpoint string) (*net.UDPConn, error) {

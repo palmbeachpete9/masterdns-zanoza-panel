@@ -1019,12 +1019,6 @@ func (a *ARQ) runFinalAckWatchdog(now time.Time) {
 	)
 }
 
-func (a *ARQ) clearTrackedControlPacket(packetType uint8, sequenceNum uint16, fragmentID uint8) {
-	a.mu.Lock()
-	delete(a.controlSndBuf, uint32(packetType)<<24|uint32(sequenceNum)<<8|uint32(fragmentID))
-	a.mu.Unlock()
-}
-
 func (a *ARQ) tryFinalizeRemoteEOF() {
 	a.mu.Lock()
 	waitingForCloseReadAck := a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_READ
@@ -1232,12 +1226,10 @@ func (a *ARQ) ioLoop() {
 				time.Sleep(ioRetryBackoff)
 				continue
 			case ioErrorEOF:
-				transientReadSince = time.Time{}
 				errorReason = "Local App Closed Connection (EOF)"
 				a.noteClientEOF(time.Now())
 				gracefulEOF = true
 			case ioErrorClosed:
-				transientReadSince = time.Time{}
 				if a.isGracefulCloseInProgress() {
 					alreadyHandled = true
 					break
@@ -1246,7 +1238,6 @@ func (a *ARQ) ioLoop() {
 				resetRequired = true
 				resetAfterDrain = n > 0
 			default:
-				transientReadSince = time.Time{}
 				errorReason = "Read Error: " + err.Error()
 				resetRequired = true
 				resetAfterDrain = n > 0
@@ -1506,7 +1497,7 @@ func (a *ARQ) ReceiveData(sn uint16, data []byte) bool {
 	if a.localWriterBroken {
 		needCloseWrite := a.localWriterBroken &&
 			!a.closeWriteSent &&
-			!(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_WRITE) &&
+			(!a.waitingAck || a.waitingAckFor != Enums.PACKET_STREAM_CLOSE_WRITE) &&
 			!a.closed &&
 			!a.rstReceived &&
 			!a.rstSent
@@ -1577,7 +1568,7 @@ func (a *ARQ) processReceivedData(sn uint16, data []byte) {
 	if a.localWriterBroken || a.closeWriteSent || a.closeWriteAcked {
 		needCloseWrite := a.localWriterBroken &&
 			!a.closeWriteSent &&
-			!(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_WRITE) &&
+			(!a.waitingAck || a.waitingAckFor != Enums.PACKET_STREAM_CLOSE_WRITE) &&
 			!a.closed &&
 			!a.rstReceived &&
 			!a.rstSent
@@ -2602,7 +2593,7 @@ func (a *ARQ) handleTerminalRetransmitState(now time.Time) bool {
 		!a.closeWriteSent &&
 		!a.closeWriteAcked &&
 		!a.closeWriteReceived &&
-		!(a.waitingAck && a.waitingAckFor == Enums.PACKET_STREAM_CLOSE_WRITE) &&
+		(!a.waitingAck || a.waitingAckFor != Enums.PACKET_STREAM_CLOSE_WRITE) &&
 		receiveDrainedForCloseWrite &&
 		peerFinishedSending
 	if shouldInitiateCloseWriteAfterEOF {
@@ -2664,10 +2655,6 @@ func (a *ARQ) checkControlRetransmits(now time.Time) {
 				a.handleTrackedPacketTTLExpiry(info.PacketType, reason)
 				return
 			}
-		}
-
-		if info.TTL == 0 {
-			// no-op: legacy retry ownership remains active for non-TTL packets
 		}
 
 		if !info.Dispatched || now.Sub(info.LastSentAt) < info.CurrentRTO {

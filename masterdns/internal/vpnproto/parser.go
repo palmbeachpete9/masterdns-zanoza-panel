@@ -10,8 +10,9 @@ package vpnproto
 import (
 	"errors"
 
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/security"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 var (

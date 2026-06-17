@@ -7,6 +7,7 @@ import (
 	"masterdnsvpn-go/internal/arq"
 	"masterdnsvpn-go/internal/compression"
 	"masterdnsvpn-go/internal/config"
+
 	DnsParser "masterdnsvpn-go/internal/dnsparser"
 	domainMatcher "masterdnsvpn-go/internal/domainmatcher"
 	Enums "masterdnsvpn-go/internal/enums"

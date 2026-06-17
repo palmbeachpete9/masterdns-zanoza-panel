@@ -219,11 +219,10 @@ func (c *transientReadConn) Close() error {
 }
 
 type transientWriteConn struct {
-	mu          sync.Mutex
-	failWrites  int
-	writes      [][]byte
-	closed      bool
-	readBlocked bool
+	mu         sync.Mutex
+	failWrites int
+	writes     [][]byte
+	closed     bool
 }
 
 func (c *transientWriteConn) Read(_ []byte) (int, error) {
@@ -511,8 +510,8 @@ func TestARQ_SendData(t *testing.T) {
 
 	// Create a pipe to simulate local connection
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -548,8 +547,8 @@ func TestARQ_ReceiveData(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1157,8 +1156,8 @@ func TestARQ_OutOfOrderReceive(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1219,8 +1218,8 @@ func TestARQ_Retransmission(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1336,8 +1335,8 @@ func TestARQ_ACKHandling(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1385,8 +1384,8 @@ func TestARQ_GracefulClose(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1432,8 +1431,8 @@ func TestARQ_ClientEOFQueuesRSTInsteadOfFIN(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1771,8 +1770,8 @@ func TestARQ_PeerFinHalfCloseStillAcceptsInboundData(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -1914,8 +1913,10 @@ func TestARQ_GracefulCloseWriteFailureStillRechecksCloseReadCompletion(t *testin
 	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.MarkCloseReadReceived()
+	if !a.ReceiveData(0, []byte("final inbound chunk")) {
+		t.Fatal("expected inbound data to be accepted before close-read completion")
+	}
 	a.markCloseReadAcked()
-	a.ReceiveData(0, []byte("final inbound chunk"))
 
 	select {
 	case <-conn.writeCh:
@@ -1962,10 +1963,10 @@ func TestARQ_ClientGracefulCloseWriteFailureQueuesCloseWrite(t *testing.T) {
 	defer a.Close("test end", CloseOptions{Force: true})
 
 	a.MarkCloseReadReceived()
-	a.markCloseReadAcked()
 	if !a.ReceiveData(0, []byte("late inbound chunk after local app died")) {
 		t.Fatal("expected inbound data to be accepted before writer failure handling")
 	}
+	a.markCloseReadAcked()
 
 	select {
 	case <-conn.writeCh:
@@ -2559,8 +2560,8 @@ func TestARQ_Reset(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 1000, &testLogger{t: t}, cfg)
 	a.Start()
@@ -2595,8 +2596,8 @@ func TestARQ_Backpressure(t *testing.T) {
 	}
 
 	localApp, arqConn := net.Pipe()
-	defer localApp.Close()
-	defer arqConn.Close()
+	defer func() { _ = localApp.Close() }()
+	defer func() { _ = arqConn.Close() }()
 
 	a := NewARQ(1, 1, enqueuer, arqConn, 10, &testLogger{t: t}, cfg)
 	a.Start()

@@ -10,17 +10,16 @@ package config
 import (
 	"flag"
 	"fmt"
-	"os"
+	"math"
 	"path/filepath"
 	"reflect"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml"
-
 	"masterdnsvpn-go/internal/compression"
+
+	"github.com/BurntSushi/toml"
 )
 
 type ClientConfig struct {
@@ -238,7 +237,7 @@ func loadClientConfigFile(filename string) (ClientConfig, error) {
 
 	switch format {
 	case configSourceJSON:
-		raw, err := os.ReadFile(path)
+		raw, err := readConfigFileLimited(path)
 		if err != nil {
 			return cfg, err
 		}
@@ -249,8 +248,15 @@ func loadClientConfigFile(filename string) (ClientConfig, error) {
 		cfg.explicitRX_TX_Workers = defined["RX_TX_Workers"]
 		cfg.explicitTunnelProcessWorkers = defined["TunnelProcessWorkers"]
 	default:
-		meta, err := toml.DecodeFile(path, &cfg)
+		raw, err := readConfigFileLimited(path)
 		if err != nil {
+			return cfg, err
+		}
+		meta, err := toml.Decode(string(raw), &cfg)
+		if err != nil {
+			return cfg, fmt.Errorf("parse TOML failed for %s: %w", path, err)
+		}
+		if err := rejectUnknownTOML(meta); err != nil {
 			return cfg, fmt.Errorf("parse TOML failed for %s: %w", path, err)
 		}
 		cfg.explicitRX_TX_Workers = meta.IsDefined("RX_TX_WORKERS")
@@ -299,6 +305,9 @@ func LoadClientConfigWithOverrides(filename string, overrides ClientConfigOverri
 		if err := applyClientConfigOverrideValues(&cfg, overrides.Values); err != nil {
 			return cfg, err
 		}
+		if _, ok := overrides.Values["RX_TX_Workers"]; ok {
+			cfg.explicitRX_TX_Workers = true
+		}
 		if _, ok := overrides.Values["TunnelProcessWorkers"]; ok {
 			cfg.explicitTunnelProcessWorkers = true
 		}
@@ -319,6 +328,9 @@ func LoadClientConfigFromJSONBase64WithOverrides(encoded string, overrides Clien
 	if len(overrides.Values) > 0 {
 		if err := applyClientConfigOverrideValues(&cfg, overrides.Values); err != nil {
 			return cfg, err
+		}
+		if _, ok := overrides.Values["RX_TX_Workers"]; ok {
+			cfg.explicitRX_TX_Workers = true
 		}
 		if _, ok := overrides.Values["TunnelProcessWorkers"]; ok {
 			cfg.explicitTunnelProcessWorkers = true
@@ -371,10 +383,10 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 		return cfg, fmt.Errorf("invalid LOCAL_DNS_PORT: %d", cfg.LocalDNSPort)
 	}
 
-	cfg.LocalDNSCacheMaxRecords = defaultIntBelow(cfg.LocalDNSCacheMaxRecords, 1, 10000)
-	cfg.LocalDNSCacheTTLSeconds = defaultFloatAtMostZero(cfg.LocalDNSCacheTTLSeconds, 14400.0)
-	cfg.LocalDNSPendingTimeoutSec = defaultFloatAtMostZero(cfg.LocalDNSPendingTimeoutSec, 300.0)
-	cfg.LocalDNSCacheFlushSec = defaultFloatAtMostZero(cfg.LocalDNSCacheFlushSec, 60.0)
+	cfg.LocalDNSCacheMaxRecords = clampInt(defaultIntBelow(cfg.LocalDNSCacheMaxRecords, 1, 10000), 1, 500000)
+	cfg.LocalDNSCacheTTLSeconds = clampFloat(defaultFloatAtMostZero(cfg.LocalDNSCacheTTLSeconds, 14400.0), 1.0, 604800.0)
+	cfg.LocalDNSPendingTimeoutSec = clampFloat(defaultFloatAtMostZero(cfg.LocalDNSPendingTimeoutSec, 300.0), 1.0, 3600.0)
+	cfg.LocalDNSCacheFlushSec = clampFloat(defaultFloatAtMostZero(cfg.LocalDNSCacheFlushSec, 60.0), 1.0, 3600.0)
 
 	if cfg.UploadCompressionType < compression.TypeOff || cfg.UploadCompressionType > compression.TypeZLIB {
 		return cfg, fmt.Errorf("invalid UPLOAD_COMPRESSION_TYPE: %d", cfg.UploadCompressionType)
@@ -384,7 +396,7 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 		return cfg, fmt.Errorf("invalid DOWNLOAD_COMPRESSION_TYPE: %d", cfg.DownloadCompressionType)
 	}
 
-	cfg.CompressionMinSize = defaultIntBelow(cfg.CompressionMinSize, 100, compression.DefaultMinSize)
+	cfg.CompressionMinSize = clampInt(defaultIntBelow(cfg.CompressionMinSize, 100, compression.DefaultMinSize), 1, int(^uint16(0)))
 
 	if cfg.ResolverBalancingStrategy < 0 || cfg.ResolverBalancingStrategy > 8 {
 		return cfg, fmt.Errorf("invalid RESOLVER_BALANCING_STRATEGY: %d", cfg.ResolverBalancingStrategy)
@@ -425,9 +437,9 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 		return cfg, fmt.Errorf("MIN_DOWNLOAD_MTU cannot be greater than MAX_DOWNLOAD_MTU")
 	}
 
-	cfg.MTUTestRetries = defaultIntBelow(cfg.MTUTestRetries, 1, 1)
-	cfg.MTUTestTimeout = defaultFloatAtMostZero(cfg.MTUTestTimeout, 2.0)
-	cfg.MTUTestParallelism = defaultIntBelow(cfg.MTUTestParallelism, 1, 1)
+	cfg.MTUTestRetries = clampInt(defaultIntBelow(cfg.MTUTestRetries, 1, 1), 1, 100)
+	cfg.MTUTestTimeout = clampFloat(defaultFloatAtMostZero(cfg.MTUTestTimeout, 2.0), 0.1, 120.0)
+	cfg.MTUTestParallelism = clampInt(defaultIntBelow(cfg.MTUTestParallelism, 1, 1), 1, 24)
 	legacyRX_TX_Workers := max(cfg.LegacyTunnelReaderWorkers, cfg.LegacyTunnelWriterWorkers)
 	if !cfg.explicitRX_TX_Workers && legacyRX_TX_Workers > 0 {
 		cfg.RX_TX_Workers = legacyRX_TX_Workers
@@ -472,7 +484,14 @@ func finalizeClientConfig(cfg ClientConfig) (ClientConfig, error) {
 		return cfg, fmt.Errorf("ENCRYPTION_KEY is required in client config")
 	}
 
-	cfg.Domains = normalizeClientDomains(cfg.Domains)
+	if len(cfg.Domains) > maxConfiguredDomains {
+		return cfg, fmt.Errorf("DOMAINS count %d exceeds limit %d", len(cfg.Domains), maxConfiguredDomains)
+	}
+	normalizedDomains, err := normalizeAndValidateDomains(cfg.Domains, "DOMAINS")
+	if err != nil {
+		return cfg, err
+	}
+	cfg.Domains = normalizedDomains
 	if len(cfg.Domains) == 0 {
 		return cfg, fmt.Errorf("DOMAINS must contain at least one domain")
 	}
@@ -503,39 +522,6 @@ func (c ClientConfig) ResolversPath() string {
 
 func (c ClientConfig) LocalDNSCachePath() string {
 	return filepath.Join(c.ConfigDir, "local_dns_cache.bin")
-}
-
-func normalizeClientDomains(domains []string) []string {
-	if len(domains) == 0 {
-		return nil
-	}
-
-	unique := make(map[string]struct{}, len(domains))
-	for _, domain := range domains {
-		normalized := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
-		if normalized == "" || normalized == "." {
-			continue
-		}
-		unique[normalized] = struct{}{}
-	}
-
-	if len(unique) == 0 {
-		return nil
-	}
-
-	normalized := make([]string, 0, len(unique))
-	for domain := range unique {
-		normalized = append(normalized, domain)
-	}
-
-	sort.Slice(normalized, func(i, j int) bool {
-		if len(normalized[i]) == len(normalized[j]) {
-			return normalized[i] < normalized[j]
-		}
-		return len(normalized[i]) > len(normalized[j])
-	})
-
-	return normalized
 }
 
 func defaultString(value, fallback string) string {
@@ -677,7 +663,7 @@ func (c ClientConfig) EffectiveMTUTestParallelism() int {
 		return max(1, c.MTUTestParallelism)
 	}
 
-	recommended := 2
+	var recommended int
 	switch {
 	case totalResolvers <= 4:
 		recommended = 2
@@ -1033,21 +1019,17 @@ func clampInt(value, minValue, maxValue int) int {
 }
 
 func defaultFloatAtMostZero(value, fallback float64) float64 {
-	if value <= 0 {
+	if value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return fallback
 	}
 
-	return value
-}
-
-func defaultFloatBelow(value, minValue, fallback float64) float64 {
-	if value < minValue {
-		return fallback
-	}
 	return value
 }
 
 func clampFloat(value, minValue, maxValue float64) float64 {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return minValue
+	}
 	if value < minValue {
 		return minValue
 	}

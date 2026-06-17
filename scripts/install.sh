@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Zanoza Panel installer (Debian/Ubuntu, run as root).
-#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
+#   sudo env ZANOZA_REF=<full-commit-sha> bash scripts/install.sh
 # Prompts for port, admin path and TLS certificate (3x-ui style), generates
 # admin credentials, builds the forked MasterDnsVPN server + the panel, and
 # installs the `zanoza` management command.
@@ -15,34 +15,92 @@ set -euo pipefail
 MODE="${ZANOZA_MODE:-install}"
 
 REPO="${ZANOZA_REPO:-https://github.com/palmbeachpete9/masterdns-zanoza-panel.git}"
-REF="${ZANOZA_REF:-main}"
+REF="${ZANOZA_REF:-}"
 SRC_DIR="${ZANOZA_SRC_DIR:-/opt/masterdns-zanoza-panel}"
 CONFIG_DIR="${ZANOZA_CONFIG_DIR:-/etc/zanoza-panel}"
-CONFIG_PATH="$CONFIG_DIR/config.json"
-# Certificates live in a ROOT-owned subdir (service-readable via group) so the
-# root renewal job never follows a service-planted symlink (V4-01).
+STATE_DIR="${ZANOZA_STATE_DIR:-/var/lib/zanoza-panel}"
+CONFIG_PATH="$STATE_DIR/config.json"
+# Root-managed configuration is physically separated from service-owned state.
 TLS_DIR="$CONFIG_DIR/certs"
 TLS_CERT="$TLS_DIR/tls.crt"
 TLS_KEY="$TLS_DIR/tls.key"
+PANEL_CONF="$CONFIG_DIR/panel.conf"
 SVC_USER="${ZANOZA_SVC_USER:-zanoza}"  # unprivileged service account (R-09)
+EXTERNAL_ORIGIN="${ZANOZA_EXTERNAL_ORIGIN:-}"
+TRUSTED_PROXIES="${ZANOZA_TRUSTED_PROXIES:-}"
 PANEL_BIN="/usr/local/bin/zanoza-panel"
 SERVER_BIN="/usr/local/bin/masterdns-server"
 CLI_BIN="/usr/local/bin/zanoza"
 # Pin to a Go patch level at/above the known-fixed stdlib floor (N01), which is
 # also >= the `go 1.25.0` directive in go.mod / masterdns/go.mod (F17).
-GO_VERSION="${GO_VERSION:-1.25.11}"
-GO_MIN_VERSION="1.25.11"
+GO_VERSION="${GO_VERSION:-1.26.4}"
+GO_MIN_VERSION="1.26.4"
 # Optional pinned Go toolchain SHA-256 (linux). When set (env or here), the
 # downloaded tarball is verified before extraction; otherwise the official
 # checksum published at go.dev is fetched and enforced (F27).
 GO_SHA256_amd64="${GO_SHA256_amd64:-}"
 GO_SHA256_arm64="${GO_SHA256_arm64:-}"
+INSTALL_FINISHED=0
+CREDENTIALS_CREATED=0
 
 log()  { printf '\033[1;32m[zanoza]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[zanoza]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[zanoza] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "запустите от root (sudo)."
+
+valid_service_user() {
+	case "$1" in
+		''|*[!a-z0-9_-]*|[0-9-]*) return 1;;
+	esac
+	[ "${#1}" -le 32 ]
+}
+
+# These paths are rendered into systemd units, sed replacements, Python
+# snippets, and the installed CLI. Restrict them to an unambiguous absolute
+# form rather than letting whitespace/metacharacters corrupt generated files.
+valid_installer_path() {
+	case "$1" in
+		/|''|*[!A-Za-z0-9_./-]*|*/../*|*/..|*/./*|*/.) return 1;;
+		/*) return 0;;
+		*) return 1;;
+	esac
+}
+
+path_is_descendant() {
+	case "$2" in "$1"/*) return 0;; *) return 1;; esac
+}
+
+paths_overlap() {
+	[ "$1" = "$2" ] || path_is_descendant "$1" "$2" || path_is_descendant "$2" "$1"
+}
+
+valid_service_user "$SVC_USER" || die "invalid ZANOZA_SVC_USER: $SVC_USER"
+for installer_path in "$SRC_DIR" "$CONFIG_DIR" "$STATE_DIR"; do
+	valid_installer_path "$installer_path" || die "invalid installer path: $installer_path"
+done
+# The installed management command recursively removes these three directories
+# on uninstall. Keep overrides inside their FHS role-specific parents and reject
+# overlapping targets so a typo can never turn uninstall/update into deletion of
+# a broad system directory or of another panel-owned tree.
+path_is_descendant /opt "$SRC_DIR" || path_is_descendant /usr/local/src "$SRC_DIR" \
+	|| die "ZANOZA_SRC_DIR must be below /opt or /usr/local/src"
+path_is_descendant /etc "$CONFIG_DIR" || die "ZANOZA_CONFIG_DIR must be below /etc"
+path_is_descendant /var/lib "$STATE_DIR" || die "ZANOZA_STATE_DIR must be below /var/lib"
+paths_overlap "$SRC_DIR" "$CONFIG_DIR" && die "source and config directories must not overlap"
+paths_overlap "$SRC_DIR" "$STATE_DIR" && die "source and state directories must not overlap"
+paths_overlap "$CONFIG_DIR" "$STATE_DIR" && die "config and state directories must not overlap"
+case "$EXTERNAL_ORIGIN$TRUSTED_PROXIES" in *$'\n'*|*$'\r'*) die "proxy/origin settings must not contain newlines";; esac
+[[ "$GO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid GO_VERSION: $GO_VERSION"
+
+cleanup_install() {
+	local status=$?
+	if [ "$INSTALL_FINISHED" != "1" ] && [ "$CREDENTIALS_CREATED" = "1" ] && command -v runuser >/dev/null 2>&1; then
+		runuser -u "$SVC_USER" -- rm -f -- "$STATE_DIR/panel.env" 2>/dev/null || true
+	fi
+	return "$status"
+}
+trap cleanup_install EXIT
 
 read_tty() { # prompt -> echoes answer; falls back to default with no tty
 	local prompt="$1" def="${2:-}"
@@ -86,6 +144,17 @@ norm_path() {
 	printf '%s' "$p"
 }
 
+valid_dns_domain() {
+	local domain="$1" label
+	[ "${#domain}" -le 253 ] && [[ "$domain" == *.* ]] || return 1
+	case "$domain" in *[!A-Za-z0-9.-]*|.*|*.|*..*) return 1;; esac
+	IFS='.' read -r -a labels <<< "$domain"
+	for label in "${labels[@]}"; do
+		[ -n "$label" ] && [ "${#label}" -le 63 ] || return 1
+		case "$label" in -*|*-) return 1;; esac
+	done
+}
+
 # --------------------------------------------------------------------------
 # Packages + Go
 # --------------------------------------------------------------------------
@@ -93,6 +162,7 @@ log "Установка пакетов..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
 apt-get install -y git curl ca-certificates openssl iproute2 build-essential socat cron >/dev/null
+command -v runuser >/dev/null 2>&1 || die "runuser is required (install util-linux)"
 
 # Dedicated unprivileged service account (R-09).
 ensure_svc_user() {
@@ -103,6 +173,73 @@ ensure_svc_user() {
 		|| die "не удалось создать пользователя ${SVC_USER}"
 }
 ensure_svc_user
+[ "$(id -u "$SVC_USER")" -ne 0 ] || die "service user must not be root"
+
+as_svc() {
+	runuser -u "$SVC_USER" -- "$@"
+}
+
+# Create service-owned state without letting root follow or mutate names inside
+# a directory controlled by the service account.
+ensure_state_dirs() {
+	[ ! -L "$STATE_DIR" ] || die "state directory must not be a symlink"
+	assert_safe_root_path "$(dirname "$STATE_DIR")"
+	if [ ! -e "$STATE_DIR" ]; then
+		install -d -o "$SVC_USER" -g "$SVC_USER" -m 0750 "$STATE_DIR"
+	fi
+	[ -d "$STATE_DIR" ] && [ ! -L "$STATE_DIR" ] || die "state path must be a real directory"
+	[ "$(stat -c '%U' "$STATE_DIR")" = "$SVC_USER" ] || die "state directory must belong to ${SVC_USER}"
+	[ ! -L "$STATE_DIR/masterdns" ] || die "runtime directory must not be a symlink"
+	as_svc mkdir -p -- "$STATE_DIR/masterdns"
+	[ -d "$STATE_DIR/masterdns" ] && [ ! -L "$STATE_DIR/masterdns" ] || die "runtime path must be a real directory"
+	as_svc chmod 0750 "$STATE_DIR" "$STATE_DIR/masterdns"
+}
+
+# Every ancestor of a root-managed path must be root-owned, non-symlink, and
+# not writable by group/other. Otherwise a service/local user can replace a
+# protected-looking child and redirect a later root write.
+assert_safe_root_path() {
+	local path="$1" cur="/"
+	case "$path" in /*) ;; *) die "root-managed path must be absolute: $path";; esac
+	IFS='/' read -r -a parts <<< "${path#/}"
+	for part in "${parts[@]}"; do
+		[ -n "$part" ] || continue
+		cur="${cur%/}/$part"
+		[ ! -L "$cur" ] || die "небезопасный symlink в root-пути: $cur"
+		[ -e "$cur" ] || continue
+		[ "$(stat -c '%u' "$cur")" = "0" ] || die "root-путь принадлежит не root: $cur"
+		local mode; mode="$(stat -c '%a' "$cur")"
+		[ $(( 8#$mode & 0022 )) -eq 0 ] || die "root-путь доступен для записи группе/прочим: $cur"
+	done
+}
+
+assert_safe_root_path "$(dirname "$CONFIG_DIR")"
+[ ! -L "$CONFIG_DIR" ] || die "config directory must not be a symlink"
+install -d -o root -g root -m 0755 "$CONFIG_DIR"
+assert_safe_root_path "$CONFIG_DIR"
+[ ! -L "$TLS_DIR" ] || die "certificate directory must not be a symlink"
+install -d -o root -g "$SVC_USER" -m 0750 "$TLS_DIR"
+for root_file in "$TLS_CERT" "$TLS_KEY" "$PANEL_CONF" "${PANEL_CONF}.bak"; do
+	[ ! -L "$root_file" ] || die "root-managed file must not be a symlink: $root_file"
+done
+ensure_state_dirs
+for state_file in "$CONFIG_PATH" "$STATE_DIR/panel.env"; do
+	[ ! -L "$state_file" ] || die "state file must not be a symlink: $state_file"
+	[ ! -e "$state_file" ] || [ -f "$state_file" ] || die "state file must be regular: $state_file"
+done
+
+# One-time migration from the legacy service-owned /etc layout. Refuse
+# symlinks and copy both state and credentials as the service account. Moving
+# config.json without panel.env would reopen first-run setup on an update.
+for legacy_name in config.json panel.env; do
+	legacy_path="$CONFIG_DIR/$legacy_name"
+	state_path="$STATE_DIR/$legacy_name"
+	if [ "$legacy_path" != "$state_path" ] && [ -e "$legacy_path" ] && [ ! -e "$state_path" ]; then
+		[ ! -L "$legacy_path" ] && [ -f "$legacy_path" ] || die "legacy $legacy_name is not a regular non-symlink file"
+		as_svc cp --no-dereference "$legacy_path" "$state_path"
+		as_svc chmod 0600 "$state_path"
+	fi
+done
 
 # go_expected_sha256 returns the pinned checksum for arch, or fetches the
 # official one published at go.dev (HTTPS) so a corrupted download is rejected
@@ -158,18 +295,25 @@ export PATH="/usr/local/go/bin:$PATH"
 # --------------------------------------------------------------------------
 # Source + build
 # --------------------------------------------------------------------------
-# Pin the build source for reproducibility/supply-chain safety: warn (or refuse)
-# when building from a mutable branch instead of a tag/commit SHA (R-08). Set
-# ZANOZA_REF to an immutable tag/commit, or ZANOZA_ALLOW_MUTABLE_REF=1 to silence.
+# Privileged builds require a full immutable commit SHA. Mutable refs are only
+# accepted through an explicit unsafe override.
 case "$REF" in
-	main|master)
-		if [ "${ZANOZA_ALLOW_MUTABLE_REF:-0}" = "1" ]; then
-			warn "Сборка из изменяемой ветки '$REF' (ZANOZA_ALLOW_MUTABLE_REF=1)."
-		else
-			warn "Сборка из изменяемой ветки '$REF'. Для воспроизводимости задайте ZANOZA_REF=<тег|коммит>."
-		fi
+	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+	*)
+		[ -n "$REF" ] || die "задайте ZANOZA_REF=<полный 40-символьный commit SHA>"
+		[ "${ZANOZA_ALLOW_MUTABLE_REF:-0}" = "1" ] || die "ZANOZA_REF должен быть полным commit SHA (или явно задайте ZANOZA_ALLOW_MUTABLE_REF=1)"
+		warn "небезопасная сборка из изменяемого ref '$REF'"
 		;;
 esac
+
+assert_safe_root_path "$(dirname "$SRC_DIR")"
+[ ! -L "$SRC_DIR" ] || die "source directory must not be a symlink"
+mkdir -p "$SRC_DIR"
+chown root:root "$SRC_DIR"
+chmod 0755 "$SRC_DIR"
+assert_safe_root_path "$SRC_DIR"
+unsafe_src="$(find "$SRC_DIR" -xdev \( -type l -o ! -user root -o -perm /022 \) -print -quit)"
+[ -z "$unsafe_src" ] || die "source tree contains an unsafe path: $unsafe_src"
 
 # A failed fetch/reset must NOT silently fall through to building stale local
 # source (F27). On update we hard-fail; on fresh install we clone or die.
@@ -178,13 +322,25 @@ esac
 # fails (V4-05).
 if [ ! -d "$SRC_DIR/.git" ]; then
 	log "Инициализация исходников из $REPO..."
-	rm -rf "$SRC_DIR"
+	[ -z "$(find "$SRC_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ] \
+		|| die "source directory is non-empty but is not a git repository: $SRC_DIR"
 	git init -q "$SRC_DIR"
 	git -C "$SRC_DIR" remote add origin "$REPO"
 fi
+# Always bind the privileged build to the repository requested for this run.
+# Otherwise an old/custom origin in a reused source tree silently wins over
+# ZANOZA_REPO and can supply the pinned-looking commit.
+existing_origin="$(git -C "$SRC_DIR" remote get-url origin 2>/dev/null || true)"
+if [ "$existing_origin" != "$REPO" ]; then
+	[ "${ZANOZA_ALLOW_REPO_CHANGE:-0}" = "1" ] \
+		|| die "source repository origin is '$existing_origin', not '$REPO'; refusing to repurpose $SRC_DIR (set ZANOZA_ALLOW_REPO_CHANGE=1 only for an intentional migration)"
+	warn "changing source repository origin from '$existing_origin' to '$REPO'"
+fi
+git -C "$SRC_DIR" remote set-url origin "$REPO"
 log "Получение ref '$REF'..."
-git -C "$SRC_DIR" fetch --depth 1 origin "$REF" || die "git fetch '$REF' не удался — установка прервана"
-git -C "$SRC_DIR" checkout -q --force --detach FETCH_HEAD || die "git checkout не удался"
+git -c core.hooksPath=/dev/null -C "$SRC_DIR" fetch --depth 1 origin "$REF" || die "git fetch '$REF' не удался — установка прервана"
+git -c core.hooksPath=/dev/null -C "$SRC_DIR" checkout -q --force --detach FETCH_HEAD || die "git checkout не удался"
+git -c core.hooksPath=/dev/null -C "$SRC_DIR" clean -q -ffdx || die "git clean не удался"
 # If REF is a full commit SHA, prove HEAD matches it exactly (V4-05).
 case "$REF" in
 	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
@@ -203,8 +359,6 @@ log "Сборка панели (web/dist встроен в бинарь)..."
 log "Сборка форка сервера MasterDnsVPN..."
 ( cd "$SRC_DIR/masterdns" && CGO_ENABLED=0 go build -o "${SERVER_BIN}.new" ./cmd/server ) || die "сборка сервера не удалась — установка прервана"
 
-mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/masterdns" "$TLS_DIR"
-
 # --------------------------------------------------------------------------
 # Prompts: port, path, certificate (3x-ui style) — fresh install only.
 # Update mode preserves all of this (F10).
@@ -216,10 +370,10 @@ if [ "$MODE" = "update" ]; then
 	[ -f "$CONFIG_PATH" ] || die "обновление невозможно: $CONFIG_PATH не найден (сначала установите панель)"
 	command -v python3 >/dev/null 2>&1 || die "python3 требуется для обновления"
 	log "Режим обновления: конфиг, учётные данные и сертификат сохранены."
-	PORT="$(python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_port',8443))")"
-	PANEL_PATH="$(python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_path','/admin'))")"
-	PANEL_ADDR="$(python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_addr','127.0.0.1'))")"
-	if python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('tls_cert') else 1)"; then USE_TLS=1; else USE_TLS=0; fi
+	PORT="$(as_svc python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_port',8443))")"
+	PANEL_PATH="$(as_svc python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_path','/admin'))")"
+	PANEL_ADDR="$(as_svc python3 -c "import json;print(json.load(open('$CONFIG_PATH')).get('panel_addr','127.0.0.1'))")"
+	if as_svc python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('tls_cert') else 1)"; then USE_TLS=1; else USE_TLS=0; fi
 	CERT_HOST="$SERVER_IP"; [ "$PANEL_ADDR" = "127.0.0.1" ] && CERT_HOST="127.0.0.1"
 	cert_choice="update"
 else
@@ -312,11 +466,15 @@ disable_self_signed_renewal() {
 # ACME_SH_REF pins the acme.sh installer to an immutable tag instead of piping a
 # mutable master branch into a shell (F27).
 ACME_SH_REF="${ACME_SH_REF:-3.1.0}"
+[[ "$ACME_SH_REF" =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid ACME_SH_REF: $ACME_SH_REF"
+if [ -n "${ACME_SH_SHA256:-}" ]; then
+	[[ "$ACME_SH_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "ACME_SH_SHA256 must be exactly 64 hex characters"
+fi
 
 case "$cert_choice" in
 	2)
 		domain="$(read_tty "Домен панели (A-запись -> ${SERVER_IP}): " "")"
-		[ -n "$domain" ] || die "домен обязателен для варианта 2."
+		valid_dns_domain "$domain" || die "укажите корректный DNS-домен для варианта 2."
 		CERT_HOST="$domain"
 		disable_self_signed_renewal
 		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_REF}) для ${domain}..."
@@ -325,11 +483,9 @@ case "$cert_choice" in
 		acme_td="$(mktemp -d)" || die "mktemp не удался"
 		acme_tarball="$acme_td/acme.tar.gz"
 		if curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_REF}.tar.gz" -o "$acme_tarball"; then
-			# Verify the tarball against a pinned checksum when provided (F27).
-			if [ -n "${ACME_SH_SHA256:-}" ]; then
-				got="$(sha256sum "$acme_tarball" | awk '{print $1}')"
-				[ "$got" = "$ACME_SH_SHA256" ] || { rm -rf "$acme_td"; die "контрольная сумма acme.sh не совпала"; }
-			fi
+			[ -n "${ACME_SH_SHA256:-}" ] || { rm -rf "$acme_td"; die "задайте обязательную ACME_SH_SHA256 для ${ACME_SH_REF}"; }
+			got="$(sha256sum "$acme_tarball" | awk '{print $1}')"
+			[ "$got" = "$ACME_SH_SHA256" ] || { rm -rf "$acme_td"; die "контрольная сумма acme.sh не совпала"; }
 			tar -xzf "$acme_tarball" -C "$acme_td"
 			( cd "$acme_td/acme.sh-${ACME_SH_REF}" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
 		else
@@ -373,13 +529,22 @@ esac
 # --------------------------------------------------------------------------
 # Credentials (login 10, password 20) + config
 # --------------------------------------------------------------------------
-ADMIN_USER="$(random_alnum 10)"
-ADMIN_PASS="$(random_alnum 20)"
-umask 077
-# Use the freshly built panel binary to hash + persist credentials with bcrypt
-# atomically — no legacy SHA-256 in shell (F07/F24).
-"${PANEL_BIN}.new" -config "$CONFIG_PATH" -set-credentials -user "$ADMIN_USER" -password "$ADMIN_PASS" >/dev/null \
-	|| die "не удалось задать учётные данные администратора"
+ADMIN_USER=""
+ADMIN_PASS=""
+if [ ! -e "$STATE_DIR/panel.env" ]; then
+	ADMIN_USER="$(random_alnum 10)"
+	ADMIN_PASS="$(random_alnum 20)"
+	umask 077
+	# Use the freshly built panel binary to hash + persist credentials with
+	# bcrypt atomically. Reinstalls preserve existing credentials, so a failed
+	# reinstall can never rotate them before the new service is proven healthy.
+	printf '%s' "$ADMIN_PASS" | as_svc "${PANEL_BIN}.new" -config "$CONFIG_PATH" -set-credentials -user "$ADMIN_USER" -password-stdin >/dev/null \
+		|| die "не удалось задать учётные данные администратора"
+	CREDENTIALS_CREATED=1
+else
+	[ -f "$STATE_DIR/panel.env" ] && [ ! -L "$STATE_DIR/panel.env" ] || die "panel.env must be a regular non-symlink file"
+	log "Существующие учётные данные администратора сохранены."
+fi
 
 CERT_JSON=""
 if [ "$USE_TLS" -eq 1 ]; then
@@ -388,20 +553,26 @@ fi
 
 # Preserve existing instances if reinstalling.
 if [ -f "$CONFIG_PATH" ] && command -v python3 >/dev/null 2>&1; then
-	python3 - "$CONFIG_PATH" "$PORT" "$PANEL_PATH" "$PANEL_ADDR" "$TLS_CERT" "$TLS_KEY" "$USE_TLS" <<'PY'
-import json,sys
+	as_svc python3 - "$CONFIG_PATH" "$PORT" "$PANEL_PATH" "$PANEL_ADDR" "$TLS_CERT" "$TLS_KEY" "$USE_TLS" <<'PY'
+import json,sys,os,tempfile
 path,port,p,addr,cert,key,tls=sys.argv[1:8]
 cfg=json.load(open(path))
 cfg.update({"panel_addr":addr,"panel_port":int(port),"panel_path":p})
 if tls=="1": cfg["tls_cert"]=cert; cfg["tls_key"]=key
 else: cfg.pop("tls_cert",None); cfg.pop("tls_key",None)
-json.dump(cfg,open(path,"w"),indent=2,ensure_ascii=False)
+fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path))
+with os.fdopen(fd,"w") as f:
+    json.dump(cfg,f,indent=2,ensure_ascii=False)
+os.chmod(tmp,0o600)
+os.replace(tmp,path)
 PY
-else
-	printf '{\n  "version": 1,\n  "name": "Zanoza Panel",\n  "panel_addr": "%s",\n  "panel_port": %s,\n  "panel_path": "%s",\n  "instances": []%b\n}\n' \
-		"$PANEL_ADDR" "$PORT" "$PANEL_PATH" "$CERT_JSON" > "$CONFIG_PATH"
+	else
+		# shellcheck disable=SC2016 # positional parameters expand inside the child shell
+		as_svc sh -c 'umask 077; printf "$1" "$2" "$3" "$4" "$5" > "$6"' sh \
+		'{\n  "version": 1,\n  "name": "Zanoza Panel",\n  "panel_addr": "%s",\n  "panel_port": %s,\n  "panel_path": "%s",\n  "instances": []%b\n}\n' \
+		"$PANEL_ADDR" "$PORT" "$PANEL_PATH" "$CERT_JSON" "$CONFIG_PATH"
 fi
-chmod 600 "$CONFIG_PATH"
+as_svc chmod 600 "$CONFIG_PATH"
 fi   # end fresh-install-only block (MODE != update)
 
 # --------------------------------------------------------------------------
@@ -415,16 +586,19 @@ UNIT_PATH="/etc/systemd/system/zanoza-panel.service"
 [ -f "$SERVER_BIN" ] && cp -f "$SERVER_BIN" "${SERVER_BIN}.bak"
 [ -f "$UNIT_PATH" ]  && cp -f "$UNIT_PATH"  "${UNIT_PATH}.bak"
 [ -f "$CLI_BIN" ]    && cp -f "$CLI_BIN"    "${CLI_BIN}.bak"
+[ -f "$PANEL_CONF" ] && cp -f "$PANEL_CONF" "${PANEL_CONF}.bak"
 
 # Render the unit + CLI with the SELECTED config dir and service user, so
 # non-default ZANOZA_CONFIG_DIR / ZANOZA_SRC_DIR / ZANOZA_SVC_USER overrides are
 # actually honoured by the installed service and management command (V4-08).
 sed -e "s#/etc/zanoza-panel#${CONFIG_DIR}#g" \
+    -e "s#/var/lib/zanoza-panel#${STATE_DIR}#g" \
     -e "s#^User=zanoza#User=${SVC_USER}#" \
     -e "s#^Group=zanoza#Group=${SVC_USER}#" \
     "$SRC_DIR/packaging/systemd/zanoza-panel.service" > "${UNIT_PATH}.gen"
 install -m 0644 "${UNIT_PATH}.gen" "$UNIT_PATH"; rm -f "${UNIT_PATH}.gen"
 sed -e "s#^CONFIG_DIR=\"/etc/zanoza-panel\"#CONFIG_DIR=\"${CONFIG_DIR}\"#" \
+    -e "s#^STATE_DIR=\"/var/lib/zanoza-panel\"#STATE_DIR=\"${STATE_DIR}\"#" \
     -e "s#^SRC_DIR=\"/opt/masterdns-zanoza-panel\"#SRC_DIR=\"${SRC_DIR}\"#" \
     -e "s#:-zanoza}#:-${SVC_USER}}#" \
     "$SRC_DIR/scripts/zanoza" > "${CLI_BIN}.gen"
@@ -432,26 +606,24 @@ install -m 0755 "${CLI_BIN}.gen" "$CLI_BIN"; rm -f "${CLI_BIN}.gen"
 mv -f "${PANEL_BIN}.new"  "$PANEL_BIN"
 mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
 
-# Hand mutable runtime state (config, creds, keyring) to the unprivileged
-# service user so the panel can run without root (R-09). Binaries stay
-# root-owned + world-executable.
-mkdir -p "$CONFIG_DIR/masterdns" "$TLS_DIR"
-chown -R "${SVC_USER}:${SVC_USER}" "$CONFIG_DIR"
-chmod 750 "$CONFIG_DIR"
-# Certificates: the DIRECTORY stays root-owned (service cannot create/symlink
-# inside it) while the files are root-owned + service-group-readable, so the
-# root renewal job writes safely and the service reads via group (V4-01).
-chown -R "root:${SVC_USER}" "$TLS_DIR"
-chmod 0750 "$TLS_DIR"
+install -d -o root -g root -m 0755 "$CONFIG_DIR"
+install -d -o root -g "$SVC_USER" -m 0750 "$TLS_DIR"
+ensure_state_dirs
 [ -f "$TLS_CERT" ] && chmod 0640 "$TLS_CERT"
 [ -f "$TLS_KEY" ]  && chmod 0640 "$TLS_KEY"
+
+# Root-owned environment file for proxy/origin settings.
+umask 027
+printf 'ZANOZA_EXTERNAL_ORIGIN=%s\nZANOZA_TRUSTED_PROXIES=%s\n' "$EXTERNAL_ORIGIN" "$TRUSTED_PROXIES" > "$PANEL_CONF"
+chown "root:${SVC_USER}" "$PANEL_CONF"
+chmod 0640 "$PANEL_CONF"
 
 # rollback_update restores each replaced artifact from its .bak, or REMOVES it
 # when there was no prior version (a failed fresh install must not leave a
 # partial installation behind) (R-07).
 rollback_update() {
 	warn "$1 — откат."
-	for art in "$PANEL_BIN" "$SERVER_BIN" "$UNIT_PATH" "$CLI_BIN"; do
+	for art in "$PANEL_BIN" "$SERVER_BIN" "$UNIT_PATH" "$CLI_BIN" "$PANEL_CONF"; do
 		if [ -f "${art}.bak" ]; then
 			mv -f "${art}.bak" "$art"
 		else
@@ -467,7 +639,8 @@ systemctl daemon-reload
 systemctl enable zanoza-panel >/dev/null 2>&1 || true
 systemctl restart zanoza-panel || true
 sleep 2
-if ! systemctl is-active --quiet zanoza-panel; then
+PANEL_RESTARTS="$(systemctl show zanoza-panel --property NRestarts --value 2>/dev/null || echo unknown)"
+if ! systemctl is-active --quiet zanoza-panel || [ "$PANEL_RESTARTS" != "0" ]; then
 	rollback_update "панель не запустилась"
 fi
 
@@ -476,18 +649,21 @@ fi
 # panel's supervisor to start it (F10).
 HAS_INSTANCES=0
 if command -v python3 >/dev/null 2>&1 && [ -f "$CONFIG_PATH" ]; then
-	python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('instances') else 1)" && HAS_INSTANCES=1 || true
+		as_svc python3 -c "import json,sys;sys.exit(0 if json.load(open('$CONFIG_PATH')).get('instances') else 1)" && HAS_INSTANCES=1 || true
 fi
 if [ "$HAS_INSTANCES" = "1" ]; then
 	# Content-bound readiness: the running server must acknowledge the EXACT
 	# keyring digest we wrote (keyring.json.applied), not merely have a process
 	# whose path matches (R-07/R-03).
-	kr="$CONFIG_DIR/masterdns/keyring.json"
+	kr="$STATE_DIR/masterdns/keyring.json"
 	ok=0
 	for _ in 1 2 3 4 5 6 7 8; do
 		if [ -f "$kr" ] && [ -f "$kr.applied" ]; then
-			want="$(sha256sum "$kr" | awk '{print $1}')"
-			got="$(tr -d '[:space:]' < "$kr.applied" 2>/dev/null)"
+			[ ! -L "$kr" ] && [ ! -L "$kr.applied" ] || rollback_update "MasterDNS readiness files contain symlinks"
+			want="$(as_svc sha256sum "$kr" | awk '{print $1}')"
+			# The applied marker is JSON. Compare its digest to the exact keyring
+			# bytes; the digest already covers the embedded generation.
+			got="$(as_svc sed -n 's/.*"digest":"\([0-9a-f]\{64\}\)".*/\1/p' "$kr.applied" 2>/dev/null)"
 			[ -n "$want" ] && [ "$want" = "$got" ] && { ok=1; break; }
 		fi
 		sleep 1
@@ -495,17 +671,20 @@ if [ "$HAS_INSTANCES" = "1" ]; then
 	[ "$ok" = "1" ] || rollback_update "MasterDNS не подтвердил применённый keyring (хосты настроены)"
 fi
 
-rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak" "${UNIT_PATH}.bak" "${CLI_BIN}.bak"
+rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak" "${UNIT_PATH}.bak" "${CLI_BIN}.bak" "${PANEL_CONF}.bak"
+INSTALL_FINISHED=1
 
 if [ "$MODE" = "update" ]; then
 	SCHEME="https"; [ "$USE_TLS" -eq 1 ] || SCHEME="http"
 	DISPLAY_HOST="$CERT_HOST"; [ "$PANEL_ADDR" = "127.0.0.1" ] && DISPLAY_HOST="127.0.0.1"
+	case "$DISPLAY_HOST" in *:*) DISPLAY_HOST="[$DISPLAY_HOST]";; esac
 	log "Обновление завершено. Панель: ${SCHEME}://${DISPLAY_HOST}:${PORT}${PANEL_PATH}"
 	exit 0
 fi
 
 SCHEME="https"; [ "$USE_TLS" -eq 1 ] || SCHEME="http"
 DISPLAY_HOST="$CERT_HOST"; [ "$PANEL_ADDR" = "127.0.0.1" ] && DISPLAY_HOST="127.0.0.1"
+case "$DISPLAY_HOST" in *:*) DISPLAY_HOST="[$DISPLAY_HOST]";; esac
 URL="${SCHEME}://${DISPLAY_HOST}:${PORT}${PANEL_PATH}"
 
 cat <<EOF
@@ -514,12 +693,14 @@ cat <<EOF
   Zanoza Panel установлена и запущена.
 
   Адрес панели : ${URL}
-  Логин        : ${ADMIN_USER}
-  Пароль       : ${ADMIN_PASS}
-
   Управление   : команда  zanoza
   (zanoza restart | zanoza uninstall | zanoza --help)
 ============================================================
 EOF
+if [ "$CREDENTIALS_CREATED" = "1" ]; then
+	printf '  Логин        : %s\n  Пароль       : %s\n' "$ADMIN_USER" "$ADMIN_PASS"
+else
+	log "Учётные данные администратора не изменены."
+fi
 [ "$PANEL_ADDR" = "127.0.0.1" ] && warn "Панель слушает только на 127.0.0.1 — настройте nginx/ssh-туннель для внешнего доступа."
 [ "$cert_choice" = "1" ] && warn "Используется self-signed сертификат — браузер покажет предупреждение, это нормально."

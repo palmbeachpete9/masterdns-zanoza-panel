@@ -1,7 +1,6 @@
 services:
   masterdnsvpn:
-    # Pin to an immutable tag/digest instead of the mutable :latest (V4-08/V4-05).
-    image: ghcr.io/masterking32/masterdnsvpn:v1
+    image: ${MASTERDNS_IMAGE:?set MASTERDNS_IMAGE to an immutable image@sha256 digest}
     restart: unless-stopped
     # Drop every Linux capability except the one needed to bind UDP/TCP :53, so
     # a server compromise has minimal kernel-level reach (V4-08).
@@ -11,10 +10,16 @@ services:
       - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
     environment:
       - DOMAIN=v.example.com
     volumes:
-      - ./data:/data
+      - masterdns-data:/data
     ports:
       - "53:53/tcp"
       - "53:53/udp"
+
+volumes:
+  masterdns-data:

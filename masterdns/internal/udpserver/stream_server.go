@@ -13,8 +13,9 @@ import (
 	"time"
 
 	"masterdnsvpn-go/internal/arq"
-	Enums "masterdnsvpn-go/internal/enums"
 	"masterdnsvpn-go/internal/mlq"
+
+	Enums "masterdnsvpn-go/internal/enums"
 )
 
 // Stream_server encapsulates an ARQ instance and its transmit queue for a single stream.
@@ -22,7 +23,6 @@ type Stream_server struct {
 	mu        sync.RWMutex
 	txQueueMu sync.Mutex
 	cleanupMu sync.Once
-	rxQueueMu sync.Mutex
 
 	ID        uint16
 	SessionID uint8

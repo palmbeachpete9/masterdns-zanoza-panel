@@ -1,8 +1,9 @@
 package main
 
-import "strings"
-
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // V4-04 — the key fingerprint must never contain the key itself.
 func TestKeyFingerprintHidesKey(t *testing.T) {

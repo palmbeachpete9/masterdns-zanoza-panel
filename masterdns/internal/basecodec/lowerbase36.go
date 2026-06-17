@@ -179,22 +179,6 @@ func newLowerBase36DecodeMap() [256]byte {
 	return table
 }
 
-func decodeLowerBase36Small(data []byte, leadingZeros int) ([]byte, error) {
-	return DecodeLowerBase36(data)
-}
-
-func decodeLowerBase36SmallString(data string, leadingZeros int) ([]byte, error) {
-	return DecodeLowerBase36String(data)
-}
-
-func decodeLowerBase36LargeBytes(data []byte, leadingZeros int) ([]byte, error) {
-	return DecodeLowerBase36(data)
-}
-
-func decodeLowerBase36LargeString(data string, leadingZeros int) ([]byte, error) {
-	return DecodeLowerBase36String(data)
-}
-
 func decodedLenLowerBase36(encodedLen int) (int, error) {
 	if encodedLen <= 0 {
 		return 0, nil

@@ -178,10 +178,11 @@ func (s *Server) deferredIdleCleanupTimeout(cleanupInterval, sessionTimeout time
 
 func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- request, readerID int) error {
 	for {
-		buffer := s.packetPool.Get().([]byte)
+		bufferPtr := s.packetPool.Get().(*[]byte)
+		buffer := *bufferPtr
 		n, addr, err := conn.ReadFromUDP(buffer)
 		if err != nil {
-			s.packetPool.Put(buffer)
+			s.packetPool.Put(bufferPtr)
 
 			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 				return nil
@@ -196,12 +197,12 @@ func (s *Server) readLoop(ctx context.Context, conn *net.UDPConn, reqCh chan<- r
 		}
 
 		select {
-		case reqCh <- request{buf: buffer, size: n, addr: addr, conn: conn}:
+		case reqCh <- request{buf: buffer, size: n, addr: addr, conn: conn, poolBuffer: bufferPtr}:
 		case <-ctx.Done():
-			s.packetPool.Put(buffer)
+			s.packetPool.Put(bufferPtr)
 			return nil
 		default:
-			s.packetPool.Put(buffer)
+			s.packetPool.Put(bufferPtr)
 			s.onDrop(addr, len(reqCh), cap(reqCh))
 		}
 	}
@@ -233,7 +234,7 @@ func (s *Server) dnsWorker(ctx context.Context, conn *net.UDPConn, reqCh <-chan 
 				}
 			}
 
-			s.packetPool.Put(req.buf)
+			s.packetPool.Put(req.poolBuffer)
 		}
 	}
 }

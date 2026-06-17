@@ -19,8 +19,10 @@ import (
 )
 
 const (
-	defaultResolverPort = 53
-	maxResolverHosts    = 65536
+	defaultResolverPort  = 53
+	maxResolverHosts     = 65536
+	maxResolverFileBytes = 8 << 20
+	maxResolverFileLines = 131072
 )
 
 type ResolverAddress struct {
@@ -44,7 +46,12 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	if err != nil {
 		return nil, nil, fmt.Errorf("resolver file not found: %s", path)
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
+	if info, err := file.Stat(); err != nil {
+		return nil, nil, fmt.Errorf("inspect resolver file %s: %w", path, err)
+	} else if info.Size() > maxResolverFileBytes {
+		return nil, nil, fmt.Errorf("resolver file %s exceeds the %d-byte size limit", path, maxResolverFileBytes)
+	}
 
 	endpoints := make([]ResolverAddress, 0, 64)
 	resolverMap := make(map[string]int, 64)
@@ -54,6 +61,9 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 	lineNum := 0
 	for scanner.Scan() {
 		lineNum++
+		if lineNum > maxResolverFileLines {
+			return nil, nil, fmt.Errorf("resolver file %s exceeds the %d-line limit", path, maxResolverFileLines)
+		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -95,6 +105,9 @@ func LoadClientResolvers(filename string) ([]ResolverAddress, map[string]int, er
 }
 
 func addResolver(endpoints *[]ResolverAddress, resolverMap map[string]int, seenIPs map[string]struct{}, ip string, port int) {
+	if len(*endpoints) >= maxResolverHosts {
+		return
+	}
 	if _, exists := seenIPs[ip]; exists {
 		return
 	}
