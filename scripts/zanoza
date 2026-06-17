@@ -22,9 +22,13 @@ SVC_USER="${ZANOZA_SVC_USER:-zanoza}"
 # both preserves file ownership and removes the root-follows-service-symlink
 # privilege-escalation primitive (V4-01/V4-02).
 as_svc(){
-	id -u "$SVC_USER" >/dev/null 2>&1 || { c_r "service user '$SVC_USER' is missing; refusing privileged state mutation"; return 1; }
-	command -v runuser >/dev/null 2>&1 || { c_r "runuser is required; refusing privileged state mutation"; return 1; }
+	id -u "$SVC_USER" >/dev/null 2>&1 || { c_r "служебный пользователь '$SVC_USER' отсутствует; привилегированное изменение состояния запрещено"; return 1; }
+	command -v runuser >/dev/null 2>&1 || { c_r "требуется runuser; привилегированное изменение состояния запрещено"; return 1; }
 	runuser -u "$SVC_USER" -- "$@"
+}
+
+is_yes(){
+	case "$1" in y|Y|yes|YES|Yes|д|Д|да|ДА|Да) return 0;; *) return 1;; esac
 }
 
 # valid_port / norm_path mirror the backend's validation (F14).
@@ -163,17 +167,17 @@ cert_menu(){
 	# or source. We only re-issue an existing self-signed certificate; switching
 	# certificate MODE (Let's Encrypt / no-TLS) is an explicit reinstall (V4-08).
 	if [ -x /usr/local/bin/zanoza-renew-cert ]; then
-		/usr/local/bin/zanoza-renew-cert && c_g "Self-signed сертификат перевыпущен."
+		/usr/local/bin/zanoza-renew-cert && c_g "Самоподписанный сертификат перевыпущен."
 	else
-		c_y "Для этой панели не настроен self-signed сертификат."
+		c_y "Для этой панели не настроен самоподписанный сертификат."
 		c_y "Смена режима сертификата выполняется отдельной переустановкой:"
-		echo "Use the pinned, checksum-verified installer command documented in README.md."
+		echo "Используйте команду установки из README.md с закреплённым SHA и проверкой контрольных сумм."
 	fi
 }
 uninstall(){
 	need_root
 	read -r -p "Удалить Zanoza Panel? Инстансы и конфиг будут удалены. [y/N]: " a
-	case "$a" in y|Y) ;; *) c_y "отменено"; return;; esac
+	if ! is_yes "$a"; then c_y "отменено"; return; fi
 	systemctl disable --now "$SERVICE" 2>/dev/null || true
 	systemctl disable --now zanoza-cert.timer 2>/dev/null || true
 	rm -f /etc/systemd/system/zanoza-panel.service /etc/systemd/system/zanoza-cert.service /etc/systemd/system/zanoza-cert.timer

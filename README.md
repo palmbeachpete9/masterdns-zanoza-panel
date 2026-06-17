@@ -22,9 +22,16 @@
 
 ## Установка
 
-Для привилегированной установки требуется проверенный полный SHA коммита.
-Сначала скачайте и проверьте установщик; не передавайте содержимое изменяемой
-ветки напрямую в root shell:
+Быстрая установка берёт текущую ветку `main` и после `git fetch` собирает
+конкретный полученный коммит:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh -o /tmp/zanoza-install.sh
+sudo bash /tmp/zanoza-install.sh
+```
+
+Для воспроизводимой привилегированной установки закрепите проверенный полный
+SHA коммита:
 
 ```sh
 git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
@@ -35,10 +42,10 @@ sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
 
 Установщик (в стиле 3x-ui) спросит:
 
-1. **Порт** — `A random port will be assigned. Customise? y/N:`
-2. **Путь панели** — `Path /admin will be assigned. Customise? y/N:`
+1. **Порт** — `Будет назначен случайный порт <порт>. Изменить? [y/N]:`
+2. **Путь панели** — `Будет назначен путь панели /admin. Изменить? [y/N]:`
 3. **Сертификат веб-панели**:
-   - **1) IP-сертификат** — self-signed на IP сервера, срок 6 дней, автопродление (systemd-таймер).
+   - **1) IP-сертификат** — самоподписанный на IP сервера, срок 6 дней, автопродление (systemd-таймер).
    - **2) Доменный сертификат** Let's Encrypt — нужна A-запись `panel.example.com` → IP сервера.
    - **3) Без сертификата** — панель слушает **только** на `127.0.0.1` (внешний доступ через nginx/SSH-туннель).
 
@@ -86,7 +93,7 @@ masterdns-zanoza-panel/
 │   ├── zanozalink.go             #   генерация ссылок zanoza://
 │   └── web/dist/                 #   собранный фронтенд (встроен в бинарь)
 ├── masterdns/                    # форк сервера MasterDnsVPN
-│   └── internal/keyring/         #   покеольцевой выбор ключей по домену
+│   └── internal/keyring/         #   выбор ключей по домену
 ├── scripts/install.sh, scripts/zanoza
 └── packaging/systemd/zanoza-panel.service
 ```

@@ -22,9 +22,15 @@ The admin creates "instances" (a **domain + encryption key** pair) and hands the
 
 ## Install
 
-Privileged installation requires an audited full commit SHA. Download and
-inspect the installer first; do not pipe mutable branch content into a root
-shell:
+Quick install tracks the current `main` branch, then builds the exact commit
+returned by `git fetch`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh -o /tmp/zanoza-install.sh
+sudo bash /tmp/zanoza-install.sh
+```
+
+For a reproducible privileged install, pin an audited full commit SHA:
 
 ```sh
 git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
@@ -35,8 +41,8 @@ sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
 
 The installer (3x-ui style) asks for:
 
-1. **Port** — `A random port will be assigned. Customise? y/N:`
-2. **Admin path** — `Path /admin will be assigned. Customise? y/N:`
+1. **Port** — `Будет назначен случайный порт <port>. Изменить? [y/N]:`
+2. **Admin path** — `Будет назначен путь панели /admin. Изменить? [y/N]:`
 3. **Web panel certificate**:
    - **1) IP certificate** — self-signed for the server IP, 6-day validity, auto-renewed via a systemd timer.
    - **2) Domain certificate** via Let's Encrypt — needs an A record `panel.example.com` → server IP.
