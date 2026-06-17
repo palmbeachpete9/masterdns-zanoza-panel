@@ -116,5 +116,6 @@ jobs:
           grep -q 'sed -n.*"digest"' scripts/install.sh
           ! grep -q 'install -d -o "\$SVC_USER".*"\$STATE_DIR/masterdns"' scripts/install.sh
           grep -q 'remote set-url origin "\$REPO"' scripts/install.sh
-          grep -q 'source directory is non-empty but is not a git repository' scripts/install.sh
+          grep -q 'find "$SRC_DIR" -mindepth 1 -maxdepth 1 -print -quit' scripts/install.sh
+          grep -q 'git init -q "$SRC_DIR"' scripts/install.sh
           for arch in AMD64 ARM64 ARMV5 ARMV7 MIPS64LE; do grep -q "RELEASE_SHA256_${arch}" masterdns/docker/Dockerfile; done
