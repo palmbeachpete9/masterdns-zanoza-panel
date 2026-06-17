@@ -26,6 +26,7 @@ CONFIG_PATH="$STATE_DIR/config.json"
 TLS_DIR="$CONFIG_DIR/certs"
 TLS_CERT="$TLS_DIR/tls.crt"
 TLS_KEY="$TLS_DIR/tls.key"
+ACME_LAST_LOG="$CONFIG_DIR/acme-last.log"
 PANEL_CONF="$CONFIG_DIR/panel.conf"
 SVC_USER="${ZANOZA_SVC_USER:-zanoza}"  # unprivileged service account (R-09)
 EXTERNAL_ORIGIN="${ZANOZA_EXTERNAL_ORIGIN:-}"
@@ -234,7 +235,7 @@ install -d -o root -g root -m 0755 "$CONFIG_DIR"
 assert_safe_root_path "$CONFIG_DIR"
 [ ! -L "$TLS_DIR" ] || die "каталог сертификатов не должен быть symlink"
 install -d -o root -g "$SVC_USER" -m 0750 "$TLS_DIR"
-for root_file in "$TLS_CERT" "$TLS_KEY" "$PANEL_CONF" "${PANEL_CONF}.bak"; do
+for root_file in "$TLS_CERT" "$TLS_KEY" "$ACME_LAST_LOG" "$PANEL_CONF" "${PANEL_CONF}.bak"; do
 	[ ! -L "$root_file" ] || die "root-managed файл не должен быть symlink: $root_file"
 done
 ensure_state_dirs
@@ -379,6 +380,7 @@ log "Сборка форка сервера MasterDnsVPN..."
 # --------------------------------------------------------------------------
 # SERVER_IP is needed by BOTH install and update branches (F10).
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+SELF_SIGNED_CERT=0
 
 if [ "$MODE" = "update" ]; then
 	[ -f "$CONFIG_PATH" ] || die "обновление невозможно: $CONFIG_PATH не найден (сначала установите панель)"
@@ -426,9 +428,11 @@ cert_choice="$(read_tty "Вариант [1/2/3] (по умолчанию 1): " "
 
 setup_self_signed() {
 	local host="$1"
+	local san_kind="DNS"
+	[[ "$host" =~ ^[0-9]+(\.[0-9]+){3}$ ]] && san_kind="IP"
 	openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
 		-keyout "$TLS_KEY" -out "$TLS_CERT" \
-		-subj "/CN=${host}" -addext "subjectAltName=IP:${host}" >/dev/null 2>&1 || \
+		-subj "/CN=${host}" -addext "subjectAltName=${san_kind}:${host}" >/dev/null 2>&1 || \
 	openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
 		-keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=${host}" >/dev/null 2>&1
 	chmod 600 "$TLS_KEY"
@@ -436,9 +440,10 @@ setup_self_signed() {
 	cat > /usr/local/bin/zanoza-renew-cert <<RENEW
 #!/usr/bin/env bash
 set -e
-host="\$(hostname -I 2>/dev/null | awk '{print \$1}')"
+host="${host}"
+san_kind="${san_kind}"
 openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
-  -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" -addext "subjectAltName=IP:\${host}" 2>/dev/null || \
+  -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" -addext "subjectAltName=\${san_kind}:\${host}" 2>/dev/null || \
 openssl req -x509 -newkey rsa:2048 -nodes -days 6 -keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=\${host}" 2>/dev/null
 chown root:${SVC_USER} "$TLS_CERT" "$TLS_KEY" 2>/dev/null || true
 chmod 0640 "$TLS_CERT" "$TLS_KEY"
@@ -463,6 +468,7 @@ WantedBy=timers.target
 UNIT
 	systemctl daemon-reload
 	systemctl enable --now zanoza-cert.timer >/dev/null 2>&1 || true
+	SELF_SIGNED_CERT=1
 }
 
 # disable_self_signed_renewal idempotently tears down the self-signed renewal
@@ -484,11 +490,37 @@ ACME_SH_REPO="${ACME_SH_REPO:-https://github.com/acmesh-official/acme.sh.git}"
 ACME_SH_COMMIT="${ACME_SH_COMMIT:-5d6f1bd2d7d1dbb2ac880dbf59d3eee7a79fb1bb}" # tag 3.1.0
 [[ "$ACME_SH_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || die "ACME_SH_COMMIT должен быть полным 40-символьным commit SHA"
 
+acme_logged() {
+	install -o root -g root -m 0600 /dev/null "$ACME_LAST_LOG"
+	if "$@" >"$ACME_LAST_LOG" 2>&1; then
+		return 0
+	fi
+	warn "acme.sh завершился с ошибкой. Последние строки лога (${ACME_LAST_LOG}):"
+	tail -n 40 "$ACME_LAST_LOG" >&2 || true
+	return 1
+}
+
+check_http_01_preflight() {
+	local domain="$1" expected_ip="$2" a_records aaaa_records port_users
+	a_records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+	if [ -n "$a_records" ] && ! printf '%s\n' "$a_records" | grep -Fxq "$expected_ip"; then
+		die "A-запись ${domain} сейчас: $(printf '%s' "$a_records" | paste -sd, -); нужен ${expected_ip}"
+	fi
+	[ -n "$a_records" ] || warn "локальная проверка DNS не смогла получить A-запись ${domain}; продолжаю, но ACME может отказать."
+	aaaa_records="$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+	if [ -n "$aaaa_records" ]; then
+		warn "у ${domain} есть AAAA-запись: $(printf '%s' "$aaaa_records" | paste -sd, -). Let's Encrypt может проверять IPv6; убедитесь, что IPv6 тоже ведет на этот сервер."
+	fi
+	port_users="$(ss -ltnp "( sport = :80 )" 2>/dev/null | awk 'NR>1 {print}' || true)"
+	[ -z "$port_users" ] || die "порт 80 уже занят: $(printf '%s' "$port_users" | tr '\n' ' ')"
+}
+
 case "$cert_choice" in
 	2)
 		domain="$(read_tty "Домен панели (A-запись -> ${SERVER_IP}): " "")"
 		valid_dns_domain "$domain" || die "укажите корректный DNS-домен для варианта 2."
 		CERT_HOST="$domain"
+		check_http_01_preflight "$domain" "$SERVER_IP"
 		disable_self_signed_renewal
 		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_COMMIT}) для ${domain}..."
 		# Root-owned private temp dir (mode 0700): no predictable, pre-creatable
@@ -497,32 +529,32 @@ case "$cert_choice" in
 		acme_src="$acme_td/acme.sh"
 		if git -c core.hooksPath=/dev/null init -q "$acme_src" &&
 			git -c core.hooksPath=/dev/null -C "$acme_src" remote add origin "$ACME_SH_REPO" &&
-			git -c core.hooksPath=/dev/null -C "$acme_src" fetch --depth 1 origin "$ACME_SH_COMMIT" &&
+			git -c core.hooksPath=/dev/null -C "$acme_src" fetch -q --depth 1 origin "$ACME_SH_COMMIT" &&
 			git -c core.hooksPath=/dev/null -C "$acme_src" checkout -q --force --detach FETCH_HEAD &&
 			[ "$(git -C "$acme_src" rev-parse HEAD)" = "$(printf '%s' "$ACME_SH_COMMIT" | tr 'A-F' 'a-f')" ]; then
-			( cd "$acme_src" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
+			( cd "$acme_src" && acme_logged ./acme.sh --install -m "admin@${domain}" ) || warn "acme.sh установлен с предупреждениями"
 		else
 			warn "не удалось получить проверенный acme.sh ${ACME_SH_COMMIT}; откат на самоподписанный сертификат."
 		fi
 		rm -rf "$acme_td"
 		if [ -x ~/.acme.sh/acme.sh ]; then
-			~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-			if ~/.acme.sh/acme.sh --issue --standalone -d "$domain" >/dev/null 2>&1; then
+			acme_logged ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt || true
+			if acme_logged ~/.acme.sh/acme.sh --issue --server letsencrypt --standalone --listen-v4 --httpport 80 -d "$domain"; then
 				# install-cert's --reloadcmd restarts the panel, which is NOT
 				# installed yet during the initial install. The reloadcmd must
 				# therefore tolerate a missing service (|| true), and the whole
 				# install-cert must run inside `if` so a failure falls back to
 				# self-signed instead of aborting the install under `set -e`.
-				if ~/.acme.sh/acme.sh --install-cert -d "$domain" \
+				if acme_logged ~/.acme.sh/acme.sh --install-cert -d "$domain" \
 					--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
-					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; systemctl restart zanoza-panel 2>/dev/null || true" >/dev/null 2>&1; then
+					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; systemctl restart zanoza-panel 2>/dev/null || true"; then
 					log "Сертификат Let's Encrypt установлен для ${domain}."
 				else
 					warn "Установка сертификата Let's Encrypt не удалась — откат на самоподписанный сертификат."
 					setup_self_signed "$domain"
 				fi
 			else
-				warn "Let's Encrypt не удался (проверьте A-запись и свободный :80). Откат на самоподписанный сертификат."
+				warn "Let's Encrypt не удался. Откат на самоподписанный сертификат; подробности выше и в ${ACME_LAST_LOG}."
 				setup_self_signed "$domain"
 			fi
 		else
@@ -716,4 +748,4 @@ else
 	log "Учётные данные администратора не изменены."
 fi
 [ "$PANEL_ADDR" = "127.0.0.1" ] && warn "Панель слушает только на 127.0.0.1 — настройте nginx/ssh-туннель для внешнего доступа."
-[ "$cert_choice" = "1" ] && warn "Используется самоподписанный сертификат — браузер покажет предупреждение, это нормально."
+[ "$SELF_SIGNED_CERT" = "1" ] && warn "Используется самоподписанный сертификат — браузер покажет предупреждение, это нормально."
