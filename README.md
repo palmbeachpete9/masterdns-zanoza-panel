@@ -91,7 +91,7 @@ masterdns-zanoza-panel/
 │   ├── config.go, auth.go        #   конфиг + авторизация (cookie/basic)
 │   ├── process.go                #   супервизор сервера MasterDnsVPN + keyring.json
 │   ├── zanozalink.go             #   генерация ссылок zanoza://
-│   └── web/dist/                 #   собранный фронтенд (встроен в бинарь)
+│   └── web/dist/                 #   собранный фронтенд (встроен в бинарник)
 ├── masterdns/                    # форк сервера MasterDnsVPN
 │   └── internal/keyring/         #   выбор ключей по домену
 ├── scripts/install.sh, scripts/zanoza

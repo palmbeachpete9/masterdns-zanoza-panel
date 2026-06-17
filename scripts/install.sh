@@ -368,7 +368,7 @@ log "Сборка из коммита ${INSTALLED_COMMIT}"
 
 # Build to temporary paths; live binaries are only swapped in after BOTH builds
 # succeed, and are rolled back if the service fails to come up (F10).
-log "Сборка панели (web/dist встроен в бинарь)..."
+log "Сборка панели (web/dist встроен в бинарник)..."
 ( cd "$SRC_DIR" && CGO_ENABLED=0 go build -o "${PANEL_BIN}.new" ./cmd/zanoza-panel ) || die "сборка панели не удалась — установка прервана"
 log "Сборка форка сервера MasterDnsVPN..."
 ( cd "$SRC_DIR/masterdns" && CGO_ENABLED=0 go build -o "${SERVER_BIN}.new" ./cmd/server ) || die "сборка сервера не удалась — установка прервана"
@@ -477,13 +477,12 @@ disable_self_signed_renewal() {
 	systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
-# ACME_SH_REF pins the acme.sh installer to an immutable tag instead of piping a
-# mutable master branch into a shell (F27).
-ACME_SH_REF="${ACME_SH_REF:-3.1.0}"
-[[ "$ACME_SH_REF" =~ ^[A-Za-z0-9._+-]+$ ]] || die "недопустимый ACME_SH_REF: $ACME_SH_REF"
-if [ -n "${ACME_SH_SHA256:-}" ]; then
-	[[ "$ACME_SH_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || die "ACME_SH_SHA256 должен содержать ровно 64 hex-символа"
-fi
+# Pin acme.sh by full commit SHA instead of requiring an operator-supplied
+# GitHub tarball checksum. This keeps the normal Let's Encrypt path usable
+# while still avoiding a mutable remote shell installer (F27).
+ACME_SH_REPO="${ACME_SH_REPO:-https://github.com/acmesh-official/acme.sh.git}"
+ACME_SH_COMMIT="${ACME_SH_COMMIT:-5d6f1bd2d7d1dbb2ac880dbf59d3eee7a79fb1bb}" # tag 3.1.0
+[[ "$ACME_SH_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]] || die "ACME_SH_COMMIT должен быть полным 40-символьным commit SHA"
 
 case "$cert_choice" in
 	2)
@@ -491,19 +490,19 @@ case "$cert_choice" in
 		valid_dns_domain "$domain" || die "укажите корректный DNS-домен для варианта 2."
 		CERT_HOST="$domain"
 		disable_self_signed_renewal
-		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_REF}) для ${domain}..."
+		log "Выпуск сертификата Let's Encrypt через acme.sh (${ACME_SH_COMMIT}) для ${domain}..."
 		# Root-owned private temp dir (mode 0700): no predictable, pre-creatable
 		# download/extract paths (V4-01).
 		acme_td="$(mktemp -d)" || die "mktemp не удался"
-		acme_tarball="$acme_td/acme.tar.gz"
-		if curl -fsSL "https://github.com/acmesh-official/acme.sh/archive/refs/tags/${ACME_SH_REF}.tar.gz" -o "$acme_tarball"; then
-			[ -n "${ACME_SH_SHA256:-}" ] || { rm -rf "$acme_td"; die "задайте обязательную ACME_SH_SHA256 для ${ACME_SH_REF}"; }
-			got="$(sha256sum "$acme_tarball" | awk '{print $1}')"
-			[ "$got" = "$ACME_SH_SHA256" ] || { rm -rf "$acme_td"; die "контрольная сумма acme.sh не совпала"; }
-			tar -xzf "$acme_tarball" -C "$acme_td"
-			( cd "$acme_td/acme.sh-${ACME_SH_REF}" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
+		acme_src="$acme_td/acme.sh"
+		if git -c core.hooksPath=/dev/null init -q "$acme_src" &&
+			git -c core.hooksPath=/dev/null -C "$acme_src" remote add origin "$ACME_SH_REPO" &&
+			git -c core.hooksPath=/dev/null -C "$acme_src" fetch --depth 1 origin "$ACME_SH_COMMIT" &&
+			git -c core.hooksPath=/dev/null -C "$acme_src" checkout -q --force --detach FETCH_HEAD &&
+			[ "$(git -C "$acme_src" rev-parse HEAD)" = "$(printf '%s' "$ACME_SH_COMMIT" | tr 'A-F' 'a-f')" ]; then
+			( cd "$acme_src" && ./acme.sh --install -m "admin@${domain}" >/dev/null 2>&1 ) || warn "acme.sh установлен с предупреждениями"
 		else
-			warn "не удалось скачать acme.sh ${ACME_SH_REF}; откат на самоподписанный сертификат."
+			warn "не удалось получить проверенный acme.sh ${ACME_SH_COMMIT}; откат на самоподписанный сертификат."
 		fi
 		rm -rf "$acme_td"
 		if [ -x ~/.acme.sh/acme.sh ]; then
