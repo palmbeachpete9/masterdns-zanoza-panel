@@ -382,6 +382,33 @@ log "Сборка форка сервера MasterDnsVPN..."
 SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 SELF_SIGNED_CERT=0
 
+set_tls_permissions() {
+	[ -f "$TLS_CERT" ] && [ ! -L "$TLS_CERT" ] || return 1
+	[ -f "$TLS_KEY" ] && [ ! -L "$TLS_KEY" ] || return 1
+	chown "root:${SVC_USER}" "$TLS_CERT" "$TLS_KEY"
+	chmod 0640 "$TLS_CERT" "$TLS_KEY"
+}
+
+tls_artifacts_valid() {
+	local host="$1" cert_pub key_pub
+	[ -s "$TLS_CERT" ] && [ -s "$TLS_KEY" ] || return 1
+	openssl x509 -in "$TLS_CERT" -noout >/dev/null 2>&1 || return 1
+	openssl pkey -in "$TLS_KEY" -noout >/dev/null 2>&1 || return 1
+	openssl x509 -in "$TLS_CERT" -noout -checkend 86400 >/dev/null 2>&1 || return 1
+	if [[ "$host" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+		openssl x509 -in "$TLS_CERT" -noout -checkip "$host" >/dev/null 2>&1 || return 1
+	else
+		openssl x509 -in "$TLS_CERT" -noout -checkhost "$host" >/dev/null 2>&1 || return 1
+	fi
+	if ! cert_pub="$(openssl x509 -in "$TLS_CERT" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; then
+		return 1
+	fi
+	if ! key_pub="$(openssl pkey -in "$TLS_KEY" -pubout -outform DER 2>/dev/null | sha256sum | awk '{print $1}')"; then
+		return 1
+	fi
+	[ -n "$cert_pub" ] && [ "$cert_pub" = "$key_pub" ]
+}
+
 if [ "$MODE" = "update" ]; then
 	[ -f "$CONFIG_PATH" ] || die "обновление невозможно: $CONFIG_PATH не найден (сначала установите панель)"
 	command -v python3 >/dev/null 2>&1 || die "python3 требуется для обновления"
@@ -435,7 +462,8 @@ setup_self_signed() {
 		-subj "/CN=${host}" -addext "subjectAltName=${san_kind}:${host}" >/dev/null 2>&1 || \
 	openssl req -x509 -newkey rsa:2048 -nodes -days 6 \
 		-keyout "$TLS_KEY" -out "$TLS_CERT" -subj "/CN=${host}" >/dev/null 2>&1
-	chmod 600 "$TLS_KEY"
+	set_tls_permissions || die "не удалось выставить права на самоподписанный сертификат"
+	tls_artifacts_valid "$host" || die "самоподписанный сертификат не прошёл проверку"
 	# Auto-renewal: regenerate every day, restart panel.
 	cat > /usr/local/bin/zanoza-renew-cert <<RENEW
 #!/usr/bin/env bash
@@ -500,6 +528,25 @@ acme_logged() {
 	return 1
 }
 
+acme_issue_skipped_not_due() {
+	grep -Eq "Domains not changed|Skipping\\. Next renewal time|Add '--force' to force renewal" "$ACME_LAST_LOG" 2>/dev/null
+}
+
+install_acme_cert() {
+	local domain="$1"
+	if acme_logged ~/.acme.sh/acme.sh --install-cert -d "$domain" \
+		--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
+		--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; systemctl restart zanoza-panel 2>/dev/null || true"; then
+		set_tls_permissions || return 1
+		if tls_artifacts_valid "$domain"; then
+			log "Сертификат Let's Encrypt установлен для ${domain}."
+			return 0
+		fi
+		warn "Сертификат Let's Encrypt установлен, но не прошёл проверку домена/ключа."
+	fi
+	return 1
+}
+
 check_http_01_preflight() {
 	local domain="$1" expected_ip="$2" a_records aaaa_records port_users
 	a_records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u || true)"
@@ -539,20 +586,19 @@ case "$cert_choice" in
 		rm -rf "$acme_td"
 		if [ -x ~/.acme.sh/acme.sh ]; then
 			acme_logged ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt || true
-			if acme_logged ~/.acme.sh/acme.sh --issue --server letsencrypt --standalone --listen-v4 --httpport 80 -d "$domain"; then
-				# install-cert's --reloadcmd restarts the panel, which is NOT
-				# installed yet during the initial install. The reloadcmd must
-				# therefore tolerate a missing service (|| true), and the whole
-				# install-cert must run inside `if` so a failure falls back to
-				# self-signed instead of aborting the install under `set -e`.
-				if acme_logged ~/.acme.sh/acme.sh --install-cert -d "$domain" \
-					--key-file "$TLS_KEY" --fullchain-file "$TLS_CERT" \
-					--reloadcmd "chown root:${SVC_USER} '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; chmod 0640 '$TLS_CERT' '$TLS_KEY' 2>/dev/null || true; systemctl restart zanoza-panel 2>/dev/null || true"; then
-					log "Сертификат Let's Encrypt установлен для ${domain}."
-				else
+			issue_args=(--issue --server letsencrypt --standalone --listen-v4 --httpport 80 -d "$domain")
+			[ "${ZANOZA_ACME_FORCE:-0}" = "1" ] && issue_args+=(--force)
+			if acme_logged ~/.acme.sh/acme.sh "${issue_args[@]}"; then
+				install_acme_cert "$domain" || {
 					warn "Установка сертификата Let's Encrypt не удалась — откат на самоподписанный сертификат."
 					setup_self_signed "$domain"
-				fi
+				}
+			elif acme_issue_skipped_not_due; then
+				warn "У acme.sh уже есть сертификат для ${domain}, срок продления ещё не наступил; устанавливаю существующий сертификат."
+				install_acme_cert "$domain" || {
+					warn "Существующий сертификат Let's Encrypt не удалось установить — откат на самоподписанный сертификат."
+					setup_self_signed "$domain"
+				}
 			else
 				warn "Let's Encrypt не удался. Откат на самоподписанный сертификат; подробности выше и в ${ACME_LAST_LOG}."
 				setup_self_signed "$domain"
@@ -654,8 +700,9 @@ mv -f "${SERVER_BIN}.new" "$SERVER_BIN"
 install -d -o root -g root -m 0755 "$CONFIG_DIR"
 install -d -o root -g "$SVC_USER" -m 0750 "$TLS_DIR"
 ensure_state_dirs
-[ -f "$TLS_CERT" ] && chmod 0640 "$TLS_CERT"
-[ -f "$TLS_KEY" ]  && chmod 0640 "$TLS_KEY"
+if [ "$USE_TLS" -eq 1 ]; then
+	set_tls_permissions || die "не удалось выставить права на TLS-сертификат"
+fi
 
 # Root-owned environment file for proxy/origin settings.
 umask 027
