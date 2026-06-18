@@ -215,7 +215,7 @@ function Modal({ title, children, onClose }: { title: string; children: React.Re
 }
 
 function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin: () => void }) {
-  const [user, setUser] = useState("admin");
+  const [user, setUser] = useState("");
   const [password, setPassword] = useState("");
   const [repeat, setRepeat] = useState("");
   const [token, setToken] = useState("");
@@ -583,10 +583,15 @@ function App() {
       setAuthenticated(false);
     }, "Пароль изменён, войдите заново");
 
-  const copyDomainKey = (instance: Instance) =>
+  const copyDomain = (domain: string) =>
     runAction(async () => {
-      await copyText(`${instance.domain} | ${instance.key}`);
-    }, "Домен и ключ скопированы");
+      await copyText(domain);
+    }, "Домен скопирован");
+
+  const copyKey = (instance: Instance) =>
+    runAction(async () => {
+      await copyText(instance.key);
+    }, "Ключ скопирован");
 
   const copyLink = (instance: Instance) =>
     runAction(async () => {
@@ -697,21 +702,31 @@ function App() {
                 return (
                   <div key={group.domain} className="overflow-hidden rounded-lg border border-border bg-background">
                     <div className="grid gap-3 p-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-                      <button
-                        className="flex min-w-0 items-center gap-3 text-left"
-                        onClick={() => setExpanded((cur) => ({ ...cur, [group.domain]: !open }))}
-                      >
-                        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-border bg-card text-muted-foreground">
+                      <div className="flex min-w-0 items-center gap-3 text-left">
+                        <button
+                          className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-border bg-card text-muted-foreground hover:bg-muted"
+                          type="button"
+                          onClick={() => setExpanded((cur) => ({ ...cur, [group.domain]: !open }))}
+                          aria-label={open ? "Свернуть домен" : "Развернуть домен"}
+                        >
                           {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-                        </span>
+                        </button>
                         <span className="min-w-0">
-                          <span className="block truncate font-mono font-semibold">{group.domain}</span>
+                          <button
+                            className="block max-w-full truncate font-mono font-semibold hover:underline disabled:opacity-60"
+                            type="button"
+                            disabled={busy}
+                            onClick={() => copyDomain(group.domain)}
+                            title="Скопировать домен"
+                          >
+                            {group.domain}
+                          </button>
                           <span className="mt-1 block text-xs text-muted-foreground">
                             {group.instances.length} ключ(ей)
                             {group.instances.length > 1 ? " · AEAD" : ""}
                           </span>
                         </span>
-                      </button>
+                      </div>
                       <div className="flex flex-wrap gap-2 lg:justify-end">
                         <button
                           className="inline-flex h-8 items-center gap-2 rounded-md border border-border px-2 text-sm hover:bg-muted disabled:opacity-60"
@@ -757,11 +772,11 @@ function App() {
                                       <button
                                         className="inline-flex h-8 items-center gap-1 rounded-md border border-border px-2 text-xs hover:bg-muted disabled:opacity-60"
                                         disabled={busy}
-                                        onClick={() => copyDomainKey(instance)}
-                                        title="Скопировать домен и ключ"
+                                        onClick={() => copyKey(instance)}
+                                        title="Скопировать ключ шифрования"
                                       >
                                         <Copy className="h-3.5 w-3.5" />
-                                        Домен+ключ
+                                        Ключ шифр.
                                       </button>
                                       <button
                                         className="inline-flex h-8 items-center gap-1 rounded-md border border-primary px-2 text-xs text-primary hover:bg-primary/10 disabled:opacity-60"
