@@ -16,8 +16,7 @@ func TestNewClampsExcessiveRecordLimit(t *testing.T) {
 }
 
 func TestStore_BinaryPersistence(t *testing.T) {
-	tempFile := "test_cache.bin"
-	defer func() { _ = os.Remove(tempFile) }()
+	tempFile := filepath.Join(t.TempDir(), "test_cache.bin")
 
 	s := New(100, time.Hour, time.Minute)
 	now := time.Now()
