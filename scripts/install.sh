@@ -29,6 +29,10 @@ PANEL_CONF="$CONFIG_DIR/panel.conf"
 SVC_USER="${ZANOZA_SVC_USER:-zanoza}"  # unprivileged service account (R-09)
 EXTERNAL_ORIGIN="${ZANOZA_EXTERNAL_ORIGIN:-}"
 TRUSTED_PROXIES="${ZANOZA_TRUSTED_PROXIES:-}"
+CLOUDFLARE_TUNNEL_TOKEN="${ZANOZA_CLOUDFLARE_TUNNEL_TOKEN:-}"
+CLOUDFLARE_ORIGIN="${ZANOZA_CLOUDFLARE_ORIGIN:-}"
+TAILSCALE_AUTHKEY="${ZANOZA_TAILSCALE_AUTHKEY:-}"
+TAILSCALE_HOSTNAME="${ZANOZA_TAILSCALE_HOSTNAME:-zanoza-panel}"
 PANEL_BIN="/usr/local/bin/zanoza-panel"
 SERVER_BIN="/usr/local/bin/masterdns-server"
 CLI_BIN="/usr/local/bin/zanoza"
@@ -91,7 +95,7 @@ path_is_descendant /var/lib "$STATE_DIR" || die "ZANOZA_STATE_DIR должен �
 paths_overlap "$SRC_DIR" "$CONFIG_DIR" && die "каталоги исходников и конфигурации не должны пересекаться"
 paths_overlap "$SRC_DIR" "$STATE_DIR" && die "каталоги исходников и состояния не должны пересекаться"
 paths_overlap "$CONFIG_DIR" "$STATE_DIR" && die "каталоги конфигурации и состояния не должны пересекаться"
-case "$EXTERNAL_ORIGIN$TRUSTED_PROXIES" in *$'\n'*|*$'\r'*) die "настройки прокси/origin не должны содержать переводы строк";; esac
+case "$EXTERNAL_ORIGIN$TRUSTED_PROXIES$CLOUDFLARE_TUNNEL_TOKEN$CLOUDFLARE_ORIGIN$TAILSCALE_AUTHKEY$TAILSCALE_HOSTNAME" in *$'\n'*|*$'\r'*) die "настройки прокси/origin/tunnel не должны содержать переводы строк";; esac
 [[ "$GO_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "недопустимый GO_VERSION: $GO_VERSION"
 
 cleanup_install() {
@@ -107,6 +111,17 @@ read_tty() { # prompt -> echoes answer; falls back to default with no tty
 	local prompt="$1" def="${2:-}"
 	if [ -r /dev/tty ]; then read -r -p "$prompt" REPLY </dev/tty || REPLY="$def"; else REPLY="$def"; fi
 	printf '%s' "${REPLY:-$def}"
+}
+
+read_secret_tty() {
+	local prompt="$1"
+	if [ -r /dev/tty ]; then
+		read -r -s -p "$prompt" REPLY </dev/tty || REPLY=""
+		printf '\n' >/dev/tty
+	else
+		REPLY=""
+	fi
+	printf '%s' "$REPLY"
 }
 
 random_port() {
@@ -156,6 +171,25 @@ valid_dns_domain() {
 	done
 }
 
+normalize_https_origin() {
+	local raw="$1" host
+	raw="${raw#"${raw%%[![:space:]]*}"}"
+	raw="${raw%"${raw##*[![:space:]]}"}"
+	raw="${raw%/}"
+	[ -n "$raw" ] || return 1
+	case "$raw" in
+		http://*) return 1;;
+		https://*) ;;
+		*) raw="https://${raw}";;
+	esac
+	host="${raw#https://}"
+	[ -n "$host" ] || return 1
+	case "$host" in
+		*/*|*'?'*|*'#'*|*[$'\t\r\n ']*|.*|*.) return 1;;
+	esac
+	printf '%s' "$raw"
+}
+
 valid_git_ref() {
 	case "$1" in
 		''|-*|*[$'\n\r\t ']*)
@@ -175,7 +209,7 @@ is_yes() {
 log "Установка пакетов..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y >/dev/null
-apt-get install -y git curl ca-certificates openssl iproute2 build-essential socat cron >/dev/null
+apt-get install -y git curl ca-certificates openssl iproute2 build-essential socat cron python3 >/dev/null
 command -v runuser >/dev/null 2>&1 || die "требуется runuser (установите пакет util-linux)"
 
 # Dedicated unprivileged service account (R-09).
@@ -442,12 +476,14 @@ CERT_HOST="$SERVER_IP"
 
 cat <<EOF
 
-Выберите сертификат для веб-панели:
+Выберите доступ к веб-панели:
   1) IP-сертификат, срок 6 дней, автопродление (самоподписанный для ${SERVER_IP})
   2) Доменный сертификат Let's Encrypt (A-запись домена -> ${SERVER_IP}, например panel.example.com)
   3) Без сертификата — панель слушает ТОЛЬКО на 127.0.0.1 (доступ через nginx/ssh-туннель)
+  4) Cloudflare Tunnel — публичный HTTPS через Cloudflare, панель локально на 127.0.0.1
+  5) Tailscale Funnel — публичный HTTPS через Tailscale, панель локально на 127.0.0.1
 EOF
-cert_choice="$(read_tty "Вариант [1/2/3] (по умолчанию 1): " "1")"
+cert_choice="$(read_tty "Вариант [1/2/3/4/5] (по умолчанию 1): " "1")"
 
 setup_self_signed() {
 	local host="$1"
@@ -558,6 +594,159 @@ check_http_01_preflight() {
 	[ -z "$port_users" ] || die "порт 80 уже занят: $(printf '%s' "$port_users" | tr '\n' ' ')"
 }
 
+add_trusted_proxy() {
+	local proxy="$1"
+	case ",${TRUSTED_PROXIES}," in
+		*,"$proxy",*) return;;
+	esac
+	if [ -n "$TRUSTED_PROXIES" ]; then
+		TRUSTED_PROXIES="${TRUSTED_PROXIES},${proxy}"
+	else
+		TRUSTED_PROXIES="$proxy"
+	fi
+}
+
+ensure_loopback_trusted_proxy() {
+	add_trusted_proxy "127.0.0.1"
+	add_trusted_proxy "::1"
+}
+
+ensure_cloudflared() {
+	if command -v cloudflared >/dev/null 2>&1; then
+		return
+	fi
+	log "Установка cloudflared..."
+	local arch deb_arch td
+	arch="$(dpkg --print-architecture)"
+	case "$arch" in
+		amd64) deb_arch="amd64";;
+		arm64) deb_arch="arm64";;
+		armhf|armel) deb_arch="arm";;
+		*) die "cloudflared: неподдерживаемая архитектура ${arch}";;
+	esac
+	td="$(mktemp -d)" || die "mktemp не удался"
+	curl -fsSL --retry 3 "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${deb_arch}.deb" -o "$td/cloudflared.deb" \
+		|| { rm -rf "$td"; die "не удалось скачать cloudflared"; }
+	dpkg -i "$td/cloudflared.deb" >/dev/null || {
+		apt-get install -f -y >/dev/null
+		dpkg -i "$td/cloudflared.deb" >/dev/null
+	}
+	rm -rf "$td"
+	command -v cloudflared >/dev/null 2>&1 || die "cloudflared не установлен"
+}
+
+configure_cloudflare_tunnel() {
+	local origin token replace had_service=0
+	origin="${CLOUDFLARE_ORIGIN:-$EXTERNAL_ORIGIN}"
+	while [ -z "$origin" ]; do
+		origin="$(read_tty "Публичный HTTPS-адрес панели в Cloudflare (например https://panel.example.com): " "")"
+		if [ -z "$origin" ]; then warn "укажите внешний адрес Cloudflare"; fi
+	done
+	EXTERNAL_ORIGIN="$(normalize_https_origin "$origin")" || die "Cloudflare origin должен быть HTTPS-адресом без пути, например https://panel.example.com"
+	token="$CLOUDFLARE_TUNNEL_TOKEN"
+	while [ -z "$token" ]; do
+		warn "В Cloudflare Zero Trust создайте Tunnel, добавьте Public Hostname -> Service: HTTP -> URL: localhost:${PORT}, затем вставьте connector token."
+		token="$(read_secret_tty "Cloudflare Tunnel token: ")"
+		[ -n "$token" ] || warn "token обязателен для автоматической настройки Cloudflare Tunnel"
+	done
+	case "$token" in *[$'\t\r\n ']* ) die "Cloudflare Tunnel token не должен содержать пробелы или переводы строк";; esac
+	ensure_loopback_trusted_proxy
+	if systemctl cat cloudflared.service >/dev/null 2>&1; then
+		had_service=1
+	fi
+	ensure_cloudflared
+	if [ "$had_service" = "1" ]; then
+		replace="$(read_tty "cloudflared.service уже существует. Переустановить его под этот Tunnel token? [y/N]: " "N")"
+		if ! is_yes "$replace"; then
+			die "Cloudflare Tunnel не настроен: существующий cloudflared.service оставлен без изменений"
+		fi
+		cloudflared service uninstall >/dev/null 2>&1 || true
+		systemctl reset-failed cloudflared.service >/dev/null 2>&1 || true
+	fi
+	log "Настройка Cloudflare Tunnel для ${EXTERNAL_ORIGIN}..."
+	if ! cloudflared service install "$token" >/dev/null; then
+		if systemctl cat cloudflared.service >/dev/null 2>&1; then
+			replace="$(read_tty "cloudflared.service мешает установке. Переустановить его под этот Tunnel token? [y/N]: " "N")"
+			if is_yes "$replace"; then
+				cloudflared service uninstall >/dev/null 2>&1 || true
+				cloudflared service install "$token" >/dev/null || die "cloudflared service install не удался"
+			else
+				die "cloudflared service install не удался"
+			fi
+		else
+			die "cloudflared service install не удался"
+		fi
+	fi
+	systemctl enable --now cloudflared.service >/dev/null 2>&1 || die "cloudflared.service не запустился"
+	sleep 2
+	systemctl is-active --quiet cloudflared.service || die "cloudflared.service не активен"
+}
+
+tailscale_version_ok() {
+	local version
+	version="$(tailscale version 2>/dev/null | awk 'NR==1 {print $1}')"
+	[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+	[ "$(printf '%s\n%s\n' "1.52.0" "$version" | sort -V | head -1)" = "1.52.0" ]
+}
+
+ensure_tailscale() {
+	if ! command -v tailscale >/dev/null 2>&1 || ! tailscale_version_ok; then
+		log "Установка/обновление Tailscale..."
+		local td
+		td="$(mktemp -d)" || die "mktemp не удался"
+		curl -fsSL --retry 3 https://tailscale.com/install.sh -o "$td/tailscale-install.sh" \
+			|| { rm -rf "$td"; die "не удалось скачать установщик Tailscale"; }
+		sh "$td/tailscale-install.sh" >/dev/null || { rm -rf "$td"; die "установка Tailscale не удалась"; }
+		rm -rf "$td"
+	fi
+	command -v tailscale >/dev/null 2>&1 || die "tailscale не установлен"
+	systemctl enable --now tailscaled.service >/dev/null 2>&1 || die "tailscaled.service не запустился"
+}
+
+tailscale_backend_state() {
+	tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true
+}
+
+ensure_tailscale_login() {
+	local state
+	case "$TAILSCALE_HOSTNAME" in
+		''|*[!A-Za-z0-9-]*|-*|*-) die "ZANOZA_TAILSCALE_HOSTNAME должен быть DNS-именем без пробелов, например zanoza-panel";;
+	esac
+	state="$(tailscale_backend_state)"
+	[ "$state" = "Running" ] && return
+	if [ -n "$TAILSCALE_AUTHKEY" ]; then
+		case "$TAILSCALE_AUTHKEY" in *[$'\t\r\n ']* ) die "ZANOZA_TAILSCALE_AUTHKEY не должен содержать пробелы или переводы строк";; esac
+		log "Авторизация Tailscale через ZANOZA_TAILSCALE_AUTHKEY..."
+		tailscale up --auth-key="$TAILSCALE_AUTHKEY" --hostname="$TAILSCALE_HOSTNAME" >/dev/null || die "tailscale up не удался"
+	else
+		log "Авторизация Tailscale: откройте ссылку, которую сейчас покажет tailscale up."
+		tailscale up --hostname="$TAILSCALE_HOSTNAME" || die "tailscale up не удался"
+	fi
+	state="$(tailscale_backend_state)"
+	[ "$state" = "Running" ] || die "Tailscale не перешёл в состояние Running (сейчас: ${state:-unknown})"
+}
+
+tailscale_dns_name() {
+	tailscale status --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("Self",{}).get("DNSName","").rstrip("."))' 2>/dev/null || true
+}
+
+configure_tailscale_funnel() {
+	local dns origin
+	ensure_loopback_trusted_proxy
+	ensure_tailscale
+	ensure_tailscale_login
+	dns="$(tailscale_dns_name)"
+	if [ -n "$dns" ]; then
+		EXTERNAL_ORIGIN="$(normalize_https_origin "$dns")" || die "не удалось определить HTTPS origin Tailscale Funnel"
+	else
+		warn "Tailscale не вернул MagicDNS-имя; проверьте, что MagicDNS и HTTPS включены в tailnet."
+		origin="$(read_tty "Публичный HTTPS-адрес Tailscale Funnel (например https://host.tailnet.ts.net): " "$EXTERNAL_ORIGIN")"
+		EXTERNAL_ORIGIN="$(normalize_https_origin "$origin")" || die "Tailscale Funnel origin должен быть HTTPS-адресом без пути"
+	fi
+	log "Включение Tailscale Funnel: ${EXTERNAL_ORIGIN}${PANEL_PATH} -> localhost:${PORT}"
+	tailscale funnel --bg --yes --https=443 "localhost:${PORT}" >/dev/null || die "tailscale funnel не удался; проверьте, что Funnel разрешён в tailnet policy, а HTTPS включён"
+}
+
 case "$cert_choice" in
 	2)
 		domain="$(read_tty "Домен панели (A-запись -> ${SERVER_IP}): " "")"
@@ -607,6 +796,18 @@ case "$cert_choice" in
 		disable_self_signed_renewal
 		USE_TLS=0
 		PANEL_ADDR="127.0.0.1"
+		;;
+	4)
+		disable_self_signed_renewal
+		USE_TLS=0
+		PANEL_ADDR="127.0.0.1"
+		configure_cloudflare_tunnel
+		;;
+	5)
+		disable_self_signed_renewal
+		USE_TLS=0
+		PANEL_ADDR="127.0.0.1"
+		configure_tailscale_funnel
 		;;
 	*)
 		setup_self_signed "$SERVER_IP"
@@ -762,18 +963,24 @@ fi
 rm -f "${PANEL_BIN}.bak" "${SERVER_BIN}.bak" "${UNIT_PATH}.bak" "${CLI_BIN}.bak" "${PANEL_CONF}.bak"
 INSTALL_FINISHED=1
 
+panel_access_url() {
+	local scheme display_host
+	if [ -n "$EXTERNAL_ORIGIN" ]; then
+		printf '%s%s' "${EXTERNAL_ORIGIN%/}" "$PANEL_PATH"
+		return
+	fi
+	scheme="https"; [ "$USE_TLS" -eq 1 ] || scheme="http"
+	display_host="$CERT_HOST"; [ "$PANEL_ADDR" = "127.0.0.1" ] && display_host="127.0.0.1"
+	case "$display_host" in *:*) display_host="[$display_host]";; esac
+	printf '%s://%s:%s%s' "$scheme" "$display_host" "$PORT" "$PANEL_PATH"
+}
+
 if [ "$MODE" = "update" ]; then
-	SCHEME="https"; [ "$USE_TLS" -eq 1 ] || SCHEME="http"
-	DISPLAY_HOST="$CERT_HOST"; [ "$PANEL_ADDR" = "127.0.0.1" ] && DISPLAY_HOST="127.0.0.1"
-	case "$DISPLAY_HOST" in *:*) DISPLAY_HOST="[$DISPLAY_HOST]";; esac
-	log "Обновление завершено. Панель: ${SCHEME}://${DISPLAY_HOST}:${PORT}${PANEL_PATH}"
+	log "Обновление завершено. Панель: $(panel_access_url)"
 	exit 0
 fi
 
-SCHEME="https"; [ "$USE_TLS" -eq 1 ] || SCHEME="http"
-DISPLAY_HOST="$CERT_HOST"; [ "$PANEL_ADDR" = "127.0.0.1" ] && DISPLAY_HOST="127.0.0.1"
-case "$DISPLAY_HOST" in *:*) DISPLAY_HOST="[$DISPLAY_HOST]";; esac
-URL="${SCHEME}://${DISPLAY_HOST}:${PORT}${PANEL_PATH}"
+URL="$(panel_access_url)"
 
 cat <<EOF
 
@@ -790,5 +997,7 @@ if [ "$CREDENTIALS_CREATED" = "1" ]; then
 else
 	log "Учётные данные администратора не изменены."
 fi
-[ "$PANEL_ADDR" = "127.0.0.1" ] && warn "Панель слушает только на 127.0.0.1 — настройте nginx/ssh-туннель для внешнего доступа."
+if [ "$PANEL_ADDR" = "127.0.0.1" ] && [ -z "$EXTERNAL_ORIGIN" ]; then
+	warn "Панель слушает только на 127.0.0.1 — настройте nginx/ssh-туннель для внешнего доступа."
+fi
 [ "$SELF_SIGNED_CERT" = "1" ] && warn "Используется самоподписанный сертификат — браузер покажет предупреждение, это нормально."

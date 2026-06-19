@@ -41,19 +41,32 @@ sudo bash scripts/install.sh
 
 1. **Порт** — `Будет назначен случайный порт <порт>. Изменить? [y/N]:`
 2. **Путь панели** — `Будет назначен путь панели /admin. Изменить? [y/N]:`
-3. **Сертификат веб-панели**:
+3. **Доступ к веб-панели**:
    - **1) IP-сертификат** — самоподписанный на IP сервера, срок 6 дней, автопродление (systemd-таймер).
    - **2) Доменный сертификат** Let's Encrypt — нужна A-запись `panel.example.com` → IP сервера.
    - **3) Без сертификата** — панель слушает **только** на `127.0.0.1` (внешний доступ через nginx/SSH-туннель).
+   - **4) Cloudflare Tunnel** — панель слушает только `127.0.0.1`, публичный HTTPS выдаёт Cloudflare. Установщик попросит публичный адрес панели и connector token из Cloudflare Zero Trust.
+   - **5) Tailscale Funnel** — панель слушает только `127.0.0.1`, публичный HTTPS выдаёт Tailscale Funnel. Установщик поставит Tailscale, авторизует ноду и включит Funnel на `443`.
 
 Для TLS-терминирующего reverse proxy задайте при установке точный внешний
 origin в `ZANOZA_EXTERNAL_ORIGIN` и IP/CIDR прокси в
 `ZANOZA_TRUSTED_PROXIES`. Заголовок `X-Forwarded-For` принимается только от
 доверенных прокси.
 
-После установки генерируются **логин (10 символов)** и **пароль (20 символов)** и выводится полный адрес панели, в зависимости от выбора в п.1-3.
+Для Cloudflare Tunnel перед выбором варианта 4 создайте Tunnel в Cloudflare
+Zero Trust, добавьте Public Hostname с `Service: HTTP` и `URL:
+localhost:<порт панели>`, затем вставьте token в установщик. Для
+неинтерактивной установки можно передать `ZANOZA_CLOUDFLARE_ORIGIN` и
+`ZANOZA_CLOUDFLARE_TUNNEL_TOKEN`.
 
-## Модель инстансов (домены + ключи)
+Для Tailscale Funnel вариант 5 требует MagicDNS, HTTPS и разрешённый Funnel в
+tailnet policy. Если сервер ещё не подключён к tailnet, установщик покажет
+ссылку авторизации; для неинтерактивной установки используйте
+`ZANOZA_TAILSCALE_AUTHKEY`.
+
+После установки генерируются **логин (10 символов)** и **пароль (20 символов)** и выводится полный адрес панели, в зависимости от выбранного способа доступа.
+
+## Модель инстансов
 
 Сервер MasterDnsVPN — это один процесс, слушающий **UDP :53**, с **одним** ключом и **одним** доменов. Чтобы раздавать пользователям **разные ключи**, панель использует форк сервера с **keyring** (`keyring.json`), который выбирает ключ(и) **по домену запроса** (домен виден до расшифровки):
 
@@ -104,6 +117,10 @@ masterdns-zanoza-panel/
 | `ZANOZA_CONFIG` | Путь к JSON-конфигу панели | `/var/lib/zanoza-panel/config.json` |
 | `ZANOZA_EXTERNAL_ORIGIN` | Точный внешний origin прокси | пусто |
 | `ZANOZA_TRUSTED_PROXIES` | Список доверенных IP/CIDR прокси | пусто |
+| `ZANOZA_CLOUDFLARE_ORIGIN` | Публичный HTTPS-origin панели для Cloudflare Tunnel | пусто |
+| `ZANOZA_CLOUDFLARE_TUNNEL_TOKEN` | Connector token для автоматической установки Cloudflare Tunnel | пусто |
+| `ZANOZA_TAILSCALE_AUTHKEY` | Auth key для неинтерактивного `tailscale up` | пусто |
+| `ZANOZA_TAILSCALE_HOSTNAME` | Hostname ноды Tailscale | `zanoza-panel` |
 | `ZANOZA_RUNTIME_DIR` | Директория для keyring.json и server_config.toml | `<configDir>/masterdns` |
 | `ZANOZA_PANEL_ADDR` | IP-адрес для HTTP-сервера | из `config.json` |
 | `ZANOZA_PANEL_PORT` | Порт панели (1–65535) | из `config.json` |

@@ -41,17 +41,28 @@ The installer (3x-ui style) asks for:
 
 1. **Port** — `Будет назначен случайный порт <port>. Изменить? [y/N]:`
 2. **Admin path** — `Будет назначен путь панели /admin. Изменить? [y/N]:`
-3. **Web panel certificate**:
+3. **Web panel access**:
    - **1) IP certificate** — self-signed for the server IP, 6-day validity, auto-renewed via a systemd timer.
    - **2) Domain certificate** via Let's Encrypt — needs an A record `panel.example.com` → server IP.
    - **3) No certificate** — the panel listens **only** on `127.0.0.1` (expose via nginx / SSH tunnel).
+   - **4) Cloudflare Tunnel** — the panel listens only on `127.0.0.1`; Cloudflare provides public HTTPS. The installer asks for the public panel origin and the connector token from Cloudflare Zero Trust.
+   - **5) Tailscale Funnel** — the panel listens only on `127.0.0.1`; Tailscale Funnel provides public HTTPS. The installer installs Tailscale, authenticates the node, and enables Funnel on `443`.
 
 For a TLS-terminating reverse proxy, set `ZANOZA_EXTERNAL_ORIGIN` to the exact
 public origin and `ZANOZA_TRUSTED_PROXIES` to the proxy IP/CIDR during install.
 Only trusted peers' `X-Forwarded-For` headers are used for login rate limiting.
 
-After install it generates a **10-char login** and **20-char password** and prints the full panel URL:
-`https://IP:PORT/admin`, `https://panel.example.com:PORT/admin`, or `http://127.0.0.1:PORT/admin`.
+For Cloudflare Tunnel, create a Tunnel in Cloudflare Zero Trust, add a Public
+Hostname with `Service: HTTP` and `URL: localhost:<panel port>`, then paste the
+connector token into the installer. For unattended installs, pass
+`ZANOZA_CLOUDFLARE_ORIGIN` and `ZANOZA_CLOUDFLARE_TUNNEL_TOKEN`.
+
+For Tailscale Funnel, option 5 requires MagicDNS, HTTPS, and Funnel permission
+in the tailnet policy. If the server is not connected yet, the installer prints
+the login URL from `tailscale up`; for unattended installs, pass
+`ZANOZA_TAILSCALE_AUTHKEY`.
+
+After install it generates a **10-char login** and **20-char password** and prints the full panel URL for the selected access mode.
 
 ## Instance model (domains × keys)
 
@@ -103,6 +114,10 @@ All variables are optional; the panel works without them using defaults.
 | `ZANOZA_RUNTIME_DIR` | Directory for keyring.json + server_config.toml | `<configDir>/masterdns` |
 | `ZANOZA_EXTERNAL_ORIGIN` | Exact public proxy origin, e.g. `https://panel.example` | empty |
 | `ZANOZA_TRUSTED_PROXIES` | Comma-separated trusted proxy IPs/CIDRs | empty |
+| `ZANOZA_CLOUDFLARE_ORIGIN` | Public HTTPS origin for Cloudflare Tunnel | empty |
+| `ZANOZA_CLOUDFLARE_TUNNEL_TOKEN` | Connector token for automatic Cloudflare Tunnel setup | empty |
+| `ZANOZA_TAILSCALE_AUTHKEY` | Auth key for unattended `tailscale up` | empty |
+| `ZANOZA_TAILSCALE_HOSTNAME` | Tailscale node hostname | `zanoza-panel` |
 | `ZANOZA_PANEL_ADDR` | HTTP listen address | from `config.json` |
 | `ZANOZA_PANEL_PORT` | Panel port (1–65535) | from `config.json` |
 | `ZANOZA_PANEL_PATH` | Admin URL path (e.g. `/secret`) | from `config.json` |
