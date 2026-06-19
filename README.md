@@ -22,22 +22,19 @@
 
 ## Установка
 
-Быстрая установка берёт текущую ветку `main` и после `git fetch` собирает
-конкретный полученный коммит:
+Быстрая установка берёт текущую ветку `main` и собирает последний полученный
+коммит:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh -o /tmp/zanoza-install.sh
-sudo bash /tmp/zanoza-install.sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
 ```
 
-Для воспроизводимой привилегированной установки закрепите проверенный полный
-SHA коммита:
+Если хотите установить вручную из git-клона последней `main`:
 
 ```sh
-git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
-cd masterdns-zanoza-panel
-git checkout --detach <AUDITED_FULL_COMMIT_SHA>
-sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
+sudo git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git /opt/masterdns-zanoza-panel
+cd /opt/masterdns-zanoza-panel
+sudo bash scripts/install.sh
 ```
 
 Установщик (в стиле 3x-ui) спросит:

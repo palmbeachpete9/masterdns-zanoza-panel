@@ -111,7 +111,7 @@ jobs:
         run: |
           bad_actions="$(grep -R --line-number -E 'uses:[[:space:]]+[^#[:space:]]+@' .github/workflows | grep -Ev '@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)"
           [ -z "$bad_actions" ] || { echo "Unpinned actions:"; echo "$bad_actions"; exit 1; }
-          ! grep -R --line-number -E 'RELEASE_TAG:-latest|raw.githubusercontent.com/.*/main/.+ \| sudo bash' scripts masterdns/docker README.en.md README.md
+          ! grep -R --line-number -E 'RELEASE_TAG:-latest' scripts masterdns/docker README.en.md README.md
           ! grep -R --line-number -E '^FROM[[:space:]]+[^@[:space:]]+([[:space:]]+AS[[:space:]]+.*)?$' masterdns/docker/Dockerfile
           grep -q 'sed -n.*"digest"' scripts/install.sh
           ! grep -q 'install -d -o "\$SVC_USER".*"\$STATE_DIR/masterdns"' scripts/install.sh

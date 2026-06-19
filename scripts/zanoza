@@ -103,7 +103,7 @@ zanoza — управление панелью Zanoza (MasterDnsVPN).
   zanoza url             показать адрес панели
   zanoza resetcreds      сгенерировать новый логин/пароль
   zanoza mfa             включить, отключить или сбросить 2FA
-  zanoza update <SHA>    обновить из указанного полного commit SHA
+  zanoza update          обновить панель до текущей main
   zanoza uninstall       удалить панель
   zanoza --help          эта справка
 
@@ -236,17 +236,10 @@ uninstall(){
 }
 update(){
 	need_root
-	local ref="${1:-${ZANOZA_UPDATE_REF:-}}"
-	if [ -z "$ref" ] && [ -r /dev/tty ]; then
-		read -r -p "Полный 40-символьный commit SHA для обновления: " ref </dev/tty
-	fi
-	case "$ref" in
-		[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
-		*) c_r "обновление требует полный 40-символьный commit SHA"; return 1;;
-	esac
+	[ -z "${1:-}" ] || { c_r "команда 'zanoza update' обновляет текущую ветку main и не принимает SHA"; return 1; }
+	local ref="${ZANOZA_UPDATE_REF:-main}"
 	# Run the on-disk installer in non-interactive update mode (preserves config,
 	# credentials, port/path/TLS, instances; atomic binary swap with rollback).
-	# Never pipe remote code straight into a root shell (F10/F27).
 	[ -f "$SRC_DIR/scripts/install.sh" ] || { c_r "исходники не найдены в $SRC_DIR — переустановите панель."; return 1; }
 	ZANOZA_MODE=update \
 	ZANOZA_REF="$ref" \

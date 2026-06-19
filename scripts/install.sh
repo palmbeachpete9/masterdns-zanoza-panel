@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # Zanoza Panel installer (Debian/Ubuntu, run as root).
-#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh -o /tmp/zanoza-install.sh
-#   sudo bash /tmp/zanoza-install.sh
-#   sudo env ZANOZA_REF=<full-commit-sha> bash scripts/install.sh
+#   curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
 # Prompts for port, admin path and TLS certificate (3x-ui style), generates
 # admin credentials, builds the forked MasterDnsVPN server + the panel, and
 # installs the `zanoza` management command.
@@ -312,15 +310,13 @@ export PATH="/usr/local/go/bin:$PATH"
 # Source + build
 # --------------------------------------------------------------------------
 # By default the installer tracks main so the documented one-line install works.
-# Operators who need reproducibility can still pin ZANOZA_REF to a full commit
-# SHA; those installs are verified byte-for-byte against the fetched HEAD.
+# ZANOZA_REF remains an internal/advanced override for custom deployments.
 PINNED_REF=0
 if [[ "$REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
 	REF="$(printf '%s' "$REF" | tr 'A-F' 'a-f')"
 	PINNED_REF=1
 else
 	valid_git_ref "$REF" || die "недопустимый ZANOZA_REF: $REF"
-	warn "установка из изменяемого ref '$REF'; для воспроизводимой установки задайте ZANOZA_REF=<полный 40-символьный commit SHA>"
 fi
 
 assert_safe_root_path "$(dirname "$SRC_DIR")"

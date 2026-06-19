@@ -22,21 +22,19 @@ The admin creates "instances" (a **domain + encryption key** pair) and hands the
 
 ## Install
 
-Quick install tracks the current `main` branch, then builds the exact commit
-returned by `git fetch`:
+Quick install tracks the current `main` branch and builds the latest fetched
+commit:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh -o /tmp/zanoza-install.sh
-sudo bash /tmp/zanoza-install.sh
+curl -fsSL https://raw.githubusercontent.com/palmbeachpete9/masterdns-zanoza-panel/main/scripts/install.sh | sudo bash
 ```
 
-For a reproducible privileged install, pin an audited full commit SHA:
+If you prefer a manual install from a latest-`main` git clone:
 
 ```sh
-git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git
-cd masterdns-zanoza-panel
-git checkout --detach <AUDITED_FULL_COMMIT_SHA>
-sudo env ZANOZA_REF=<AUDITED_FULL_COMMIT_SHA> bash scripts/install.sh
+sudo git clone https://github.com/palmbeachpete9/masterdns-zanoza-panel.git /opt/masterdns-zanoza-panel
+cd /opt/masterdns-zanoza-panel
+sudo bash scripts/install.sh
 ```
 
 The installer (3x-ui style) asks for:
