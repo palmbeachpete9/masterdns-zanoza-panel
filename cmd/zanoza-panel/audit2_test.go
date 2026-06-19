@@ -126,11 +126,13 @@ func newTestServer(t *testing.T) *server {
 		t.Fatal(err)
 	}
 	return &server{
-		cfg:      defaultConfig(),
-		creds:    loadCredentials(filepath.Join(t.TempDir(), "panel.env")),
-		sessions: newSessionStore(),
-		limiter:  newLoginLimiter(8, time.Minute),
-		setup:    gate,
+		cfg:        defaultConfig(),
+		creds:      loadCredentials(filepath.Join(t.TempDir(), "panel.env")),
+		mfa:        loadMFAStore(filepath.Join(t.TempDir(), "mfa.json")),
+		mfaTickets: newMFATicketStore(),
+		sessions:   newSessionStore(),
+		limiter:    newLoginLimiter(8, time.Minute),
+		setup:      gate,
 	}
 }
 

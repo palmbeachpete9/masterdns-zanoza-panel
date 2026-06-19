@@ -99,7 +99,7 @@ case "$EXTERNAL_ORIGIN$TRUSTED_PROXIES" in *$'\n'*|*$'\r'*) die "настрой�
 cleanup_install() {
 	local status=$?
 	if [ "$INSTALL_FINISHED" != "1" ] && [ "$CREDENTIALS_CREATED" = "1" ] && command -v runuser >/dev/null 2>&1; then
-		runuser -u "$SVC_USER" -- rm -f -- "$STATE_DIR/panel.env" 2>/dev/null || true
+		runuser -u "$SVC_USER" -- rm -f -- "$STATE_DIR/panel.env" "$STATE_DIR/mfa.json" 2>/dev/null || true
 	fi
 	return "$status"
 }
@@ -239,7 +239,7 @@ for root_file in "$TLS_CERT" "$TLS_KEY" "$ACME_LAST_LOG" "$PANEL_CONF" "${PANEL_
 	[ ! -L "$root_file" ] || die "root-managed файл не должен быть symlink: $root_file"
 done
 ensure_state_dirs
-for state_file in "$CONFIG_PATH" "$STATE_DIR/panel.env"; do
+for state_file in "$CONFIG_PATH" "$STATE_DIR/panel.env" "$STATE_DIR/mfa.json"; do
 	[ ! -L "$state_file" ] || die "файл состояния не должен быть symlink: $state_file"
 	[ ! -e "$state_file" ] || [ -f "$state_file" ] || die "файл состояния должен быть обычным файлом: $state_file"
 done

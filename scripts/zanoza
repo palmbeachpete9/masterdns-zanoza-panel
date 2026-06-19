@@ -102,6 +102,7 @@ zanoza — управление панелью Zanoza (MasterDnsVPN).
   zanoza status          статус сервиса
   zanoza url             показать адрес панели
   zanoza resetcreds      сгенерировать новый логин/пароль
+  zanoza mfa             включить, отключить или сбросить 2FA
   zanoza update <SHA>    обновить из указанного полного commit SHA
   zanoza uninstall       удалить панель
   zanoza --help          эта справка
@@ -130,6 +131,42 @@ reset_creds(){
 	echo "  Логин:  $user"
 	echo "  Пароль: $pass"
 	echo "  Адрес:  $(panel_url)"
+}
+
+mfa_menu(){
+	need_root
+	local status ch code
+	status="$(as_svc "$PANEL_BIN" -config "$CONFIG_PATH" -mfa-status 2>/dev/null || echo unknown)"
+	echo
+	c_g "============ 2FA / Google Authenticator ============"
+	echo "  Статус: $status"
+	echo "  1) Включить или сбросить 2FA"
+	echo "  2) Отключить 2FA"
+	echo "  0) Назад"
+	read -r -p "Выбор: " ch
+	case "$ch" in
+		1)
+			as_svc "$PANEL_BIN" -config "$CONFIG_PATH" -mfa-setup-start \
+				|| { c_r "не удалось начать настройку 2FA"; return 1; }
+			echo
+			echo "Добавьте секрет в Google Authenticator, затем введите 6-значный код."
+			read -r -p "Код 2FA: " code
+			printf '%s' "$code" | as_svc "$PANEL_BIN" -config "$CONFIG_PATH" -mfa-setup-confirm -mfa-code-stdin \
+				|| { c_r "не удалось подтвердить 2FA"; return 1; }
+			systemctl restart "$SERVICE" 2>/dev/null || true
+			c_g "2FA включена. Панель перезапущена."
+			;;
+		2)
+			read -r -p "Отключить 2FA для панели? [y/N]: " ch
+			if ! is_yes "$ch"; then c_y "отменено"; return; fi
+			as_svc "$PANEL_BIN" -config "$CONFIG_PATH" -mfa-disable \
+				|| { c_r "не удалось отключить 2FA"; return 1; }
+			systemctl restart "$SERVICE" 2>/dev/null || true
+			c_g "2FA отключена. Панель перезапущена."
+			;;
+		0) return;;
+		*) c_r "неизвестный пункт";;
+	esac
 }
 
 # apply_config_change snapshots config.json, applies a key/value, restarts and
@@ -189,7 +226,7 @@ uninstall(){
 	rm -f -- "$CONFIG_DIR/panel.conf" "$CONFIG_DIR/panel.conf.bak" "$TLS_CERT" "$CONFIG_DIR/certs/tls.key"
 	rmdir -- "$CONFIG_DIR/certs" "$CONFIG_DIR" 2>/dev/null || true
 	as_svc rm -rf -- "$STATE_DIR/masterdns"
-	as_svc rm -f -- "$STATE_DIR/config.json" "$STATE_DIR/config.json.bak" "$STATE_DIR/panel.env" "$STATE_DIR/setup.token"
+	as_svc rm -f -- "$STATE_DIR/config.json" "$STATE_DIR/config.json.bak" "$STATE_DIR/panel.env" "$STATE_DIR/mfa.json" "$STATE_DIR/setup.token"
 	rmdir -- "$STATE_DIR" 2>/dev/null || true
 	# The source tree is root-owned, validated by the installer, and dedicated
 	# to this product; it is the only recursively removed installation tree.
@@ -229,27 +266,29 @@ menu(){
 		echo "  Сервис: $(systemctl is-active "$SERVICE" 2>/dev/null || echo unknown)   Адрес: $(panel_url)"
 		echo "  1) Показать адрес панели"
 		echo "  2) Сбросить логин/пароль"
-		echo "  3) Изменить порт"
-		echo "  4) Изменить путь"
-		echo "  5) Сертификат (перевыпуск/настройка)"
-		echo "  6) Перезапустить панель"
-		echo "  7) Логи панели"
-		echo "  8) Статус"
-		echo "  9) Обновить панель"
-		echo " 10) Удалить панель"
+		echo "  3) 2FA / Google Authenticator"
+		echo "  4) Изменить порт"
+		echo "  5) Изменить путь"
+		echo "  6) Сертификат (перевыпуск/настройка)"
+		echo "  7) Перезапустить панель"
+		echo "  8) Логи панели"
+		echo "  9) Статус"
+		echo " 10) Обновить панель"
+		echo " 11) Удалить панель"
 		echo "  0) Выход"
 		read -r -p "Выбор: " ch
 		case "$ch" in
 			1) echo "Адрес: $(panel_url)";;
 			2) reset_creds;;
-			3) change_port;;
-			4) change_path;;
-			5) cert_menu;;
-			6) need_root; systemctl restart "$SERVICE"; c_g "перезапущено";;
-			7) journalctl -u "$SERVICE" -n 100 --no-pager || true;;
-			8) systemctl status "$SERVICE" --no-pager || true;;
-			9) update;;
-			10) uninstall; break;;
+			3) mfa_menu;;
+			4) change_port;;
+			5) change_path;;
+			6) cert_menu;;
+			7) need_root; systemctl restart "$SERVICE"; c_g "перезапущено";;
+			8) journalctl -u "$SERVICE" -n 100 --no-pager || true;;
+			9) systemctl status "$SERVICE" --no-pager || true;;
+			10) update;;
+			11) uninstall; break;;
 			0) break;;
 			*) c_r "неизвестный пункт";;
 		esac
@@ -264,6 +303,7 @@ case "${1:-}" in
 	status) systemctl status "$SERVICE" --no-pager || true;;
 	url) panel_url;;
 	resetcreds) reset_creds;;
+	mfa) mfa_menu;;
 	uninstall) uninstall;;
 	update) update "${2:-}";;
 	-h|--help|help) cmd_help;;

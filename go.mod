@@ -6,6 +6,7 @@ toolchain go1.26.4
 
 require (
 	github.com/golangci/golangci-lint/v2 v2.12.2
+	github.com/pquerna/otp v1.5.0
 	mvdan.cc/gofumpt v0.10.0
 )
 
@@ -44,6 +45,7 @@ require (
 	github.com/blizzy78/varnamelen v0.8.0 // indirect
 	github.com/bombsimon/wsl/v4 v4.7.0 // indirect
 	github.com/bombsimon/wsl/v5 v5.8.0 // indirect
+	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/breml/bidichk v0.3.3 // indirect
 	github.com/breml/errchkjson v0.4.1 // indirect
 	github.com/butuzov/ireturn v0.4.1 // indirect

@@ -36,6 +36,8 @@ var embeddedWeb embed.FS
 type server struct {
 	cfg            *Config
 	creds          *credentials
+	mfa            *mfaStore
+	mfaTickets     *mfaTicketStore
 	sessions       *sessionStore
 	limiter        *loginLimiter
 	manager        *serverManager
@@ -133,7 +135,13 @@ func main() {
 	credUser := flag.String("user", "", "username for -set-credentials")
 	passwordStdin := flag.Bool("password-stdin", false, "read the -set-credentials password from stdin")
 	legacyCredPass := flag.String("password", "", "unsupported: passwords must be supplied with -password-stdin")
+	mfaStatusFlag := flag.Bool("mfa-status", false, "print MFA status and exit")
+	mfaSetupStartFlag := flag.Bool("mfa-setup-start", false, "start MFA setup and print the setup secret/URI")
+	mfaSetupConfirmFlag := flag.Bool("mfa-setup-confirm", false, "confirm pending MFA setup using a code from stdin")
+	mfaDisableFlag := flag.Bool("mfa-disable", false, "disable MFA and exit")
+	mfaCodeStdin := flag.Bool("mfa-code-stdin", false, "read the MFA code from stdin")
 	flag.Parse()
+	configDir := filepath.Dir(*configPath)
 
 	// Credential management subcommand: lets the installer and `zanoza
 	// resetcreds` reuse the backend's bcrypt + atomic-persist path instead of
@@ -146,12 +154,55 @@ func main() {
 		if err != nil {
 			log.Fatalf("read credentials password: %v", err)
 		}
-		configDir := filepath.Dir(*configPath)
 		creds := loadCredentials(filepath.Join(configDir, "panel.env"))
 		if err := creds.set(*credUser, credPass); err != nil {
 			log.Fatalf("set credentials: %v", err)
 		}
 		fmt.Println("credentials updated")
+		return
+	}
+
+	if *mfaStatusFlag || *mfaSetupStartFlag || *mfaSetupConfirmFlag || *mfaDisableFlag {
+		creds := loadCredentials(filepath.Join(configDir, "panel.env"))
+		if err := creds.loadError(); err != nil {
+			log.Fatalf("credentials: %v", err)
+		}
+		mfa := loadMFAStore(filepath.Join(configDir, "mfa.json"))
+		if err := mfa.loadError(); err != nil {
+			log.Fatalf("MFA: %v", err)
+		}
+		switch {
+		case *mfaStatusFlag:
+			if mfa.status().Enabled {
+				fmt.Println("enabled")
+			} else {
+				fmt.Println("disabled")
+			}
+		case *mfaSetupStartFlag:
+			view, err := mfa.startSetup(creds.username())
+			if err != nil {
+				log.Fatalf("MFA setup: %v", err)
+			}
+			fmt.Printf("Секрет: %s\n", view.Secret)
+			fmt.Printf("URI: %s\n", view.OtpauthURL)
+		case *mfaSetupConfirmFlag:
+			if !*mfaCodeStdin {
+				log.Fatalf("MFA setup confirm: use -mfa-code-stdin")
+			}
+			code, err := readMFACode(os.Stdin)
+			if err != nil {
+				log.Fatalf("MFA code: %v", err)
+			}
+			if err := mfa.forceConfirmSetup(code); err != nil {
+				log.Fatalf("MFA setup confirm: %v", err)
+			}
+			fmt.Println("MFA enabled")
+		case *mfaDisableFlag:
+			if err := mfa.forceDisable(); err != nil {
+				log.Fatalf("MFA disable: %v", err)
+			}
+			fmt.Println("MFA disabled")
+		}
 		return
 	}
 
@@ -166,7 +217,6 @@ func main() {
 		log.Fatalf("invalid effective config: %v", err)
 	}
 
-	configDir := filepath.Dir(*configPath)
 	creds := loadCredentials(filepath.Join(configDir, "panel.env"))
 	// Fail closed: if panel.env exists but is unreadable/malformed, do NOT start
 	// (a transient read error must never reopen unauthenticated setup) (V4-02).
@@ -174,6 +224,10 @@ func main() {
 		log.Fatalf("credentials: %v (refusing to start; fix or run `zanoza resetcreds`)", err)
 	}
 	maybeAutoSetup(creds)
+	mfa := loadMFAStore(filepath.Join(configDir, "mfa.json"))
+	if err := mfa.loadError(); err != nil {
+		log.Fatalf("MFA: %v (refusing to start; fix or run `zanoza mfa disable`)", err)
+	}
 	manager := newServerManager(envDefault(EnvRuntimeDir, filepath.Join(configDir, "masterdns")))
 
 	webRoot, err := fs.Sub(embeddedWeb, "web/dist")
@@ -232,6 +286,8 @@ func main() {
 	srv := &server{
 		cfg:            cfg,
 		creds:          creds,
+		mfa:            mfa,
+		mfaTickets:     newMFATicketStore(),
 		sessions:       newSessionStore(),
 		limiter:        newLoginLimiter(8, 5*time.Minute),
 		manager:        manager,
@@ -429,6 +485,16 @@ func (s *server) api(w http.ResponseWriter, r *http.Request, rest string) {
 		s.handleAuthSetup(w, r)
 	case "auth/login":
 		s.handleAuthLogin(w, r)
+	case "auth/mfa/verify":
+		s.handleAuthMFAVerify(w, r)
+	case "auth/mfa/setup/start":
+		s.handleAuthMFASetupStart(w, r)
+	case "auth/mfa/setup/confirm":
+		s.handleAuthMFASetupConfirm(w, r)
+	case "auth/mfa/skip":
+		s.handleAuthMFASkip(w, r)
+	case "auth/mfa/disable":
+		s.requireAuth(w, r, s.handleAuthMFADisable)
 	case "auth/logout":
 		s.requireAuth(w, r, s.handleAuthLogout)
 	case "auth/password":
@@ -699,6 +765,7 @@ func (s *server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{
 		"authenticated":  s.authenticated(r),
 		"setup_required": s.creds.setupRequired(),
+		"mfa_enabled":    s.mfa.status().Enabled,
 	})
 }
 
@@ -740,13 +807,12 @@ func (s *server) handleAuthSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setup.consume()
-	token, err := s.sessions.create()
+	ticket, err := s.mfaTickets.create(mfaTicketSetup)
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "session error")
+		writeErr(w, http.StatusInternalServerError, "MFA setup error")
 		return
 	}
-	s.setSessionCookie(w, token)
-	writeJSON(w, map[string]any{"ok": true})
+	writeJSON(w, map[string]any{"ok": true, "mfa_setup_required": true, "ticket": ticket})
 }
 
 func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -781,13 +847,10 @@ func (s *server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.limiter.reset(limitKey)
-	token, err := s.sessions.create()
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "session error")
+	if !s.mfaLoginResponse(w) {
 		return
 	}
-	s.setSessionCookie(w, token)
-	writeJSON(w, map[string]any{"ok": true})
+	s.issueSession(w)
 }
 
 func (s *server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -836,6 +899,7 @@ func (s *server) handleAuthPassword(w http.ResponseWriter, r *http.Request) {
 	s.limiter.reset(limitKey)
 	// A password change invalidates every existing session (F07).
 	s.sessions.revokeAll()
+	s.mfaTickets.revokeAll()
 	s.setSessionCookie(w, "")
 	writeJSON(w, map[string]any{"ok": true})
 }
@@ -900,6 +964,7 @@ func (s *server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			"name":       meta.Name,
 			"panel_path": meta.PanelPath,
 			"admin_user": s.creds.username(),
+			"mfa":        s.mfa.status(),
 		})
 	case http.MethodPut:
 		var body struct{ Name string }

@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Server,
   Settings,
+  ShieldCheck,
   Trash2,
   X,
 } from "lucide-react";
@@ -74,6 +75,23 @@ type SettingsState = {
   name: string;
   panel_path: string;
   admin_user: string;
+  mfa: {
+    enabled: boolean;
+    prompted: boolean;
+  };
+};
+
+type MFASetup = {
+  secret: string;
+  otpauth_url: string;
+  qr_data_url: string;
+};
+
+type AuthResponse = {
+  ok: boolean;
+  mfa_required?: boolean;
+  mfa_setup_required?: boolean;
+  ticket?: string;
 };
 
 type InstanceForm = {
@@ -219,21 +237,87 @@ function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin
   const [password, setPassword] = useState("");
   const [repeat, setRepeat] = useState("");
   const [token, setToken] = useState("");
+  const [mfaMode, setMfaMode] = useState<"password" | "verify" | "setup">("password");
+  const [mfaTicket, setMfaTicket] = useState("");
+  const [mfaCode, setMfaCode] = useState("");
+  const [mfaSetup, setMfaSetup] = useState<MFASetup | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+
+  const startMFASetup = async (ticket: string) => {
+    const res = await request("api/auth/mfa/setup/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ticket }),
+    });
+    setMfaSetup((await res.json()) as MFASetup);
+  };
+
+  const handleAuthResponse = async (res: Response) => {
+    const body = (await res.json()) as AuthResponse;
+    if (body.mfa_required && body.ticket) {
+      setMfaTicket(body.ticket);
+      setMfaMode("verify");
+      setMfaCode("");
+      return;
+    }
+    if (body.mfa_setup_required && body.ticket) {
+      setMfaTicket(body.ticket);
+      setMfaMode("setup");
+      setMfaCode("");
+      await startMFASetup(body.ticket);
+      return;
+    }
+    onLogin();
+  };
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault();
     setBusy(true);
     setError("");
     try {
+      if (mfaMode === "verify") {
+        const res = await request("api/auth/mfa/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticket: mfaTicket, code: mfaCode }),
+        });
+        await handleAuthResponse(res);
+        return;
+      }
+      if (mfaMode === "setup") {
+        const res = await request("api/auth/mfa/setup/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ticket: mfaTicket, code: mfaCode }),
+        });
+        await handleAuthResponse(res);
+        return;
+      }
       if (setupRequired && password !== repeat) throw new Error("Пароли не совпадают");
-      await request(setupRequired ? "api/auth/setup" : "api/auth/login", {
+      const res = await request(setupRequired ? "api/auth/setup" : "api/auth/login", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(setupRequired ? { user, password, token } : { user, password }),
       });
-      onLogin();
+      await handleAuthResponse(res);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const skipMFASetup = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const res = await request("api/auth/mfa/skip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ticket: mfaTicket }),
+      });
+      await handleAuthResponse(res);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -250,63 +334,122 @@ function LoginView({ setupRequired, onLogin }: { setupRequired: boolean; onLogin
           </div>
           <div>
             <h1 className="text-xl font-semibold tracking-normal">Zanoza Panel</h1>
-            <div className="text-sm text-muted-foreground">{setupRequired ? "Первичная настройка" : "Вход в панель"}</div>
+            <div className="text-sm text-muted-foreground">
+              {mfaMode === "setup" ? "Настройка 2FA" : mfaMode === "verify" ? "Код 2FA" : setupRequired ? "Первичная настройка" : "Вход в панель"}
+            </div>
           </div>
         </div>
-        <label className="grid gap-2 text-sm text-muted-foreground">
-          Логин
-          <input
-            className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
-            value={user}
-            onChange={(event) => setUser(event.target.value)}
-            autoComplete="username"
-          />
-        </label>
-        <label className="grid gap-2 text-sm text-muted-foreground">
-          Пароль
-          <input
-            className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            autoComplete="current-password"
-          />
-        </label>
-        {setupRequired && (
-          <label className="grid gap-2 text-sm text-muted-foreground">
-            Повтор пароля
-            <input
-              className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
-              type="password"
-              value={repeat}
-              onChange={(event) => setRepeat(event.target.value)}
-              autoComplete="new-password"
-            />
-          </label>
+        {mfaMode === "password" && (
+          <>
+            <label className="grid gap-2 text-sm text-muted-foreground">
+              Логин
+              <input
+                className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+                value={user}
+                onChange={(event) => setUser(event.target.value)}
+                autoComplete="username"
+              />
+            </label>
+            <label className="grid gap-2 text-sm text-muted-foreground">
+              Пароль
+              <input
+                className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+                type="password"
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                autoComplete="current-password"
+              />
+            </label>
+            {setupRequired && (
+              <label className="grid gap-2 text-sm text-muted-foreground">
+                Повтор пароля
+                <input
+                  className="h-10 rounded-md border border-border bg-background px-3 text-foreground outline-none focus:border-primary"
+                  type="password"
+                  value={repeat}
+                  onChange={(event) => setRepeat(event.target.value)}
+                  autoComplete="new-password"
+                />
+              </label>
+            )}
+            {setupRequired && (
+              <label className="grid gap-2 text-sm text-muted-foreground">
+                Токен первичной настройки
+                <input
+                  className="h-10 rounded-md border border-border bg-background px-3 font-mono text-foreground outline-none focus:border-primary"
+                  value={token}
+                  onChange={(event) => setToken(event.target.value)}
+                  placeholder="из лога сервера / setup.token"
+                  autoComplete="off"
+                />
+                <span className="text-xs text-muted-foreground/80">
+                  Напечатан в журнале сервера при первом запуске (и в файле {"setup.token"}).
+                </span>
+              </label>
+            )}
+          </>
         )}
-        {setupRequired && (
+        {mfaMode === "verify" && (
           <label className="grid gap-2 text-sm text-muted-foreground">
-            Токен первичной настройки
+            Код из Google Authenticator
             <input
               className="h-10 rounded-md border border-border bg-background px-3 font-mono text-foreground outline-none focus:border-primary"
-              value={token}
-              onChange={(event) => setToken(event.target.value)}
-              placeholder="из лога сервера / setup.token"
-              autoComplete="off"
+              value={mfaCode}
+              onChange={(event) => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              autoFocus
             />
-            <span className="text-xs text-muted-foreground/80">
-              Напечатан в журнале сервера при первом запуске (и в файле {"setup.token"}).
-            </span>
           </label>
         )}
+        {mfaMode === "setup" && (
+          <div className="grid gap-3 text-sm text-muted-foreground">
+            <div>
+              Отсканируйте QR-код в Google Authenticator, затем введите 6-значный код. Можно пропустить и включить 2FA позже в настройках.
+            </div>
+            {mfaSetup?.qr_data_url && (
+              <div className="grid place-items-center rounded-md border border-border bg-white p-3">
+                <img className="h-[220px] w-[220px]" src={mfaSetup.qr_data_url} alt="QR-код 2FA" />
+              </div>
+            )}
+            {mfaSetup?.secret && (
+              <div className="rounded-md border border-border bg-background p-3">
+                <div className="text-xs text-muted-foreground">Секрет для ручного ввода</div>
+                <div className="mt-1 break-all font-mono text-xs text-foreground">{mfaSetup.secret}</div>
+              </div>
+            )}
+            <label className="grid gap-2">
+              Код 2FA
+              <input
+                className="h-10 rounded-md border border-border bg-background px-3 font-mono text-foreground outline-none focus:border-primary"
+                value={mfaCode}
+                onChange={(event) => setMfaCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                inputMode="numeric"
+                autoComplete="one-time-code"
+              />
+            </label>
+          </div>
+        )}
         {error && <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-sm text-destructive">{error}</div>}
-        <button
-          className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90 disabled:opacity-60"
-          disabled={busy}
-        >
-          <Lock className="h-4 w-4" />
-          {setupRequired ? "Сохранить пароль" : "Войти"}
-        </button>
+        <div className="flex flex-wrap gap-2">
+          <button
+            className="inline-flex h-10 flex-1 items-center justify-center gap-2 rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90 disabled:opacity-60"
+            disabled={busy}
+          >
+            <Lock className="h-4 w-4" />
+            {mfaMode === "setup" ? "Подключить 2FA" : mfaMode === "verify" ? "Подтвердить" : setupRequired ? "Сохранить пароль" : "Войти"}
+          </button>
+          {mfaMode === "setup" && (
+            <button
+              className="inline-flex h-10 items-center justify-center rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80 disabled:opacity-60"
+              type="button"
+              disabled={busy}
+              onClick={skipMFASetup}
+            >
+              Пропустить
+            </button>
+          )}
+        </div>
       </form>
     </div>
   );
@@ -425,6 +568,9 @@ function App() {
   const [nameDraft, setNameDraft] = useState("");
   const [pwdCurrent, setPwdCurrent] = useState("");
   const [pwdNew, setPwdNew] = useState("");
+  const [settingsMFASetup, setSettingsMFASetup] = useState<MFASetup | null>(null);
+  const [settingsMFACode, setSettingsMFACode] = useState("");
+  const [settingsMFACurrentCode, setSettingsMFACurrentCode] = useState("");
 
   const loadState = async () => {
     const res = await request("api/state");
@@ -582,6 +728,43 @@ function App() {
       setShowSettings(false);
       setAuthenticated(false);
     }, "Пароль изменён, войдите заново");
+
+  const startSettingsMFASetup = () =>
+    runAction(async () => {
+      const res = await request("api/auth/mfa/setup/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      setSettingsMFASetup((await res.json()) as MFASetup);
+      setSettingsMFACode("");
+    }, settings?.mfa.enabled ? "Отсканируйте новый QR-код и подтвердите сброс" : "Отсканируйте QR-код и подтвердите 2FA");
+
+  const confirmSettingsMFASetup = () =>
+    runAction(async () => {
+      await request("api/auth/mfa/setup/confirm", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: settingsMFACode, current_code: settingsMFACurrentCode }),
+      });
+      setSettingsMFASetup(null);
+      setSettingsMFACode("");
+      setSettingsMFACurrentCode("");
+      await loadSettings();
+    }, "2FA включена");
+
+  const disableSettingsMFA = () =>
+    runAction(async () => {
+      await request("api/auth/mfa/disable", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: settingsMFACurrentCode }),
+      });
+      setSettingsMFASetup(null);
+      setSettingsMFACode("");
+      setSettingsMFACurrentCode("");
+      await loadSettings();
+    }, "2FA отключена");
 
   const copyDomain = (domain: string) =>
     runAction(async () => {
@@ -902,6 +1085,111 @@ function App() {
               >
                 Изменить пароль
               </button>
+            </div>
+
+            <div className="grid gap-3 rounded-md border border-border bg-background p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-sm font-medium text-foreground">
+                  <ShieldCheck className="h-4 w-4 text-primary" />
+                  Двухфакторная аутентификация
+                </div>
+                <span
+                  className={`rounded-full px-2 py-1 text-xs ${
+                    settings?.mfa.enabled ? "bg-primary/15 text-primary" : "bg-muted text-muted-foreground"
+                  }`}
+                >
+                  {settings?.mfa.enabled ? "Включена" : "Отключена"}
+                </span>
+              </div>
+              <div className="text-xs text-muted-foreground">
+                Поддерживается Google Authenticator и любые приложения с TOTP-кодами.
+              </div>
+              {settingsMFASetup ? (
+                <div className="grid gap-3">
+                  <div className="grid place-items-center rounded-md border border-border bg-white p-3">
+                    <img className="h-[220px] w-[220px]" src={settingsMFASetup.qr_data_url} alt="QR-код 2FA" />
+                  </div>
+                  <div className="rounded-md border border-border bg-card p-3">
+                    <div className="text-xs text-muted-foreground">Секрет для ручного ввода</div>
+                    <div className="mt-1 break-all font-mono text-xs text-foreground">{settingsMFASetup.secret}</div>
+                  </div>
+                  {settings?.mfa.enabled && (
+                    <label className="grid gap-2 text-sm text-muted-foreground">
+                      Текущий код 2FA
+                      <input
+                        className="h-10 rounded-md border border-border bg-card px-3 font-mono text-foreground outline-none focus:border-primary"
+                        value={settingsMFACurrentCode}
+                        onChange={(event) => setSettingsMFACurrentCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                        inputMode="numeric"
+                        autoComplete="one-time-code"
+                      />
+                    </label>
+                  )}
+                  <label className="grid gap-2 text-sm text-muted-foreground">
+                    Новый код 2FA
+                    <input
+                      className="h-10 rounded-md border border-border bg-card px-3 font-mono text-foreground outline-none focus:border-primary"
+                      value={settingsMFACode}
+                      onChange={(event) => setSettingsMFACode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="inline-flex h-9 w-fit items-center rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90 disabled:opacity-60"
+                      disabled={busy || settingsMFACode.length !== 6 || (settings?.mfa.enabled && settingsMFACurrentCode.length !== 6)}
+                      onClick={confirmSettingsMFASetup}
+                    >
+                      Подтвердить 2FA
+                    </button>
+                    <button
+                      className="inline-flex h-9 w-fit items-center rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80 disabled:opacity-60"
+                      disabled={busy}
+                      onClick={() => setSettingsMFASetup(null)}
+                    >
+                      Отмена
+                    </button>
+                  </div>
+                </div>
+              ) : settings?.mfa.enabled ? (
+                <div className="grid gap-3">
+                  <label className="grid gap-2 text-sm text-muted-foreground">
+                    Текущий код 2FA
+                    <input
+                      className="h-10 rounded-md border border-border bg-card px-3 font-mono text-foreground outline-none focus:border-primary"
+                      value={settingsMFACurrentCode}
+                      onChange={(event) => setSettingsMFACurrentCode(event.target.value.replace(/\D/g, "").slice(0, 6))}
+                      inputMode="numeric"
+                      autoComplete="one-time-code"
+                    />
+                  </label>
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      className="inline-flex h-9 w-fit items-center rounded-md border border-border bg-muted px-3 text-sm hover:bg-muted/80 disabled:opacity-60"
+                      disabled={busy}
+                      onClick={startSettingsMFASetup}
+                    >
+                      Сбросить 2FA
+                    </button>
+                    <button
+                      className="inline-flex h-9 w-fit items-center rounded-md border border-destructive/40 px-3 text-sm text-destructive hover:bg-destructive/10 disabled:opacity-60"
+                      disabled={busy || settingsMFACurrentCode.length !== 6}
+                      onClick={disableSettingsMFA}
+                    >
+                      Отключить 2FA
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <button
+                  className="inline-flex h-9 w-fit items-center rounded-md bg-primary px-3 text-sm font-medium text-black hover:bg-primary/90 disabled:opacity-60"
+                  disabled={busy}
+                  onClick={startSettingsMFASetup}
+                >
+                  Включить 2FA
+                </button>
+              )}
             </div>
           </div>
         </Modal>
